@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/engineering-study-kit/schema.json",
+  "title": "Engineering Study Kit V0 shared definitions",
+  "description": "Shared enums plus JSONL record shapes for evidence.jsonl and events.jsonl. Markdown frontmatter is validated by kernel.py directly, not by this schema. The record definitions mirror kernel.py; if they disagree, kernel.py behavior wins.",
+  "$defs": {
+    "confidence": {
+      "enum": ["hypothesis", "inferred", "observed", "corroborated", "executed", "verified"],
+      "description": "V0 commands create only hypothesis, inferred or observed. 'verified' is reserved and rejected by check."
+    },
+    "severity": { "enum": ["low", "medium", "high", "critical"] },
+    "evidenceType": {
+      "enum": [
+        "source-inspection",
+        "configuration-inspection",
+        "test-run",
+        "static-analysis",
+        "runtime-observation",
+        "manual-reproduction"
+      ]
+    },
+    "anchorState": { "enum": ["ok", "stale", "missing_file", "missing_symbol", "unchecked"] },
+    "kind": { "enum": ["system", "flow", "finding", "run"] },
+    "status": {
+      "description": "Allowed statuses depend on kind: system/flow = draft, reviewed, deprecated; finding = open, triaged, dismissed; run = open, ended, source_changed.",
+      "enum": ["draft", "reviewed", "deprecated", "open", "triaged", "dismissed", "ended", "source_changed"]
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+      "description": "RFC 3339 UTC, second precision."
+    },
+    "gitSha": { "type": "string", "pattern": "^([0-9a-f]{40}|[0-9a-f]{64})$" },
+    "anchorId": { "type": "string", "pattern": "^ANC-\\d{4,}$" },
+    "evidenceId": { "type": "string", "pattern": "^EV-\\d{4,}$" },
+    "runId": { "type": "string", "pattern": "^RUN-\\d{4,}$" },
+    "artifactId": {
+      "type": "string",
+      "pattern": "^(SYS-[a-z0-9]+(-[a-z0-9]+)*|FLOW-[a-z0-9]+(-[a-z0-9]+)*|F-\\d{4,}|RUN-\\d{4,}|ANC-\\d{4,}|CLM-\\d{4,}|EV-\\d{4,})$"
+    },
+    "anchorRecord": {
+      "description": "One JSON object per line inside the study:anchors block of a System, Flow or Finding.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "repository", "commit", "path", "symbol", "start_line", "end_line", "fingerprint", "created_at"],
+      "properties": {
+        "id": { "$ref": "#/$defs/anchorId" },
+        "repository": { "type": "string" },
+        "commit": { "oneOf": [{ "$ref": "#/$defs/gitSha" }, { "type": "null" }] },
+        "path": { "type": "string", "minLength": 1, "description": "Repository-relative POSIX path; no '..', no absolute paths." },
+        "symbol": { "type": ["string", "null"] },
+        "start_line": { "type": "integer", "minimum": 1 },
+        "end_line": { "type": "integer", "minimum": 1 },
+        "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "SHA-256 over selected lines, trailing whitespace stripped per line, joined with \\n." },
+        "created_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "evidenceRecord": {
+      "description": "One line of runs/RUN-NNNN/evidence.jsonl. Append-only.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "id", "subject", "type", "repository_commit", "anchors", "producer", "timestamp", "result", "limitations", "command", "exit_code"],
+      "properties": {
+        "schema": { "const": "engineering-study-evidence/v1" },
+        "id": { "$ref": "#/$defs/evidenceId" },
+        "subject": { "$ref": "#/$defs/artifactId" },
+        "type": { "$ref": "#/$defs/evidenceType" },
+        "repository_commit": { "oneOf": [{ "$ref": "#/$defs/gitSha" }, { "type": "null" }] },
+        "anchors": { "type": "array", "items": { "$ref": "#/$defs/anchorId" } },
+        "producer": { "type": "string", "minLength": 1 },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "result": { "type": "string", "minLength": 1 },
+        "limitations": { "type": "array", "items": { "type": "string" } },
+        "command": { "type": ["string", "null"], "description": "Recorded text only. The kernel never executes it." },
+        "exit_code": { "type": ["integer", "null"] }
+      }
+    },
+    "eventRecord": {
+      "description": "One line of runs/RUN-NNNN/events.jsonl. Cold diagnostic history, not engineering truth. Extra keys inside 'detail' are allowed; long strings are truncated.",
+      "type": "object",
+      "required": ["schema", "timestamp", "run", "action", "agent", "refs", "detail"],
+      "properties": {
+        "schema": { "const": "engineering-study-event/v1" },
+        "timestamp": { "$ref": "#/$defs/timestamp" },
+        "run": { "$ref": "#/$defs/runId" },
+        "action": { "type": "string", "minLength": 1 },
+        "agent": { "type": "string", "minLength": 1 },
+        "refs": { "type": "array", "items": { "type": "string" } },
+        "detail": { "type": "object" }
+      }
+    }
+  },
+  "oneOf": [
+    { "$ref": "#/$defs/evidenceRecord" },
+    { "$ref": "#/$defs/eventRecord" },
+    { "$ref": "#/$defs/anchorRecord" }
+  ]
+}
