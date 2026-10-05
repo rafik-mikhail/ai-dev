@@ -28,6 +28,7 @@ import contextlib
 import dataclasses
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -341,6 +342,13 @@ class StudyFS:
 
     def mkdirs(self, path: Any) -> None:
         self.check_write(path).mkdir(parents=True, exist_ok=True)
+
+    def rmdir_empty(self, path: Any) -> None:
+        self.check_write(path)
+        try:
+            os.rmdir(str(path))
+        except OSError:
+            pass
 
     def mkdir_exclusive(self, path: Any) -> None:
         self.check_write(path)
@@ -719,7 +727,7 @@ def parse_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
     """Parse the supported YAML-like subset. Returns (fields, body)."""
     if text.startswith("\ufeff"):
         text = text[1:]
-    text = text.replace("\r\n", "\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     if not lines or lines[0] != "---":
         raise KitError("missing opening '---' frontmatter delimiter on line 1")
@@ -1072,7 +1080,9 @@ def evaluate_anchor(ctx: "Context", rec: Dict[str, Any], dirty: Set[str]) -> str
 def load_template(ctx: "Context", name: str) -> str:
     path = ctx.study / "templates" / name
     try:
-        return ctx.fs.read_bytes(path).decode("utf-8")
+        text = ctx.fs.read_bytes(path).decode("utf-8")
+        # a template checked out with CRLF line endings (or saved with a BOM) must still render
+        return text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     except (OSError, KitError):
         raise KitError("template missing or unreadable: %s (run init --force to restore)" % ctx.display(path))
 
@@ -2129,13 +2139,17 @@ def cmd_run_start(ctx: Context, args: argparse.Namespace) -> int:
         raise KitError("could not allocate a run ID")
     started = utc_now()
     title = goal if len(goal) <= 120 else goal[:117] + "..."
-    text = render_template(template, {
-        "id": run_id, "title": title, "goal": goal, "agent": ctx.agent, "started": started,
-        "updated": started, "updated_by": ctx.agent,
-        "initial_state_text": format_state_lines(snapshot),
-        "initial_state_json": comment_safe_json(snapshot),
-    })
-    check_rendered(text, "run", run_id)
+    try:
+        text = render_template(template, {
+            "id": run_id, "title": title, "goal": goal, "agent": ctx.agent, "started": started,
+            "updated": started, "updated_by": ctx.agent,
+            "initial_state_text": format_state_lines(snapshot),
+            "initial_state_json": comment_safe_json(snapshot),
+        })
+        check_rendered(text, "run", run_id)
+    except KitError:
+        ctx.fs.rmdir_empty(run_dir)  # a failed start must not leave a run directory without a summary
+        raise
     ctx.fs.create_exclusive(run_dir / "summary.md", encode_text(text))
     ctx.fs.create_exclusive(run_dir / "evidence.jsonl", b"")
     ctx.fs.create_exclusive(run_dir / "events.jsonl", b"")
@@ -3373,6 +3387,194 @@ class KitArgumentParser(argparse.ArgumentParser):
         raise KitError(message)
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Agent tool definitions. Generated from the argument parser, so the tool list cannot drift from the CLI.
+# `tools list` exports them; `tools call` runs one from JSON arguments without a shell.
+# ---------------------------------------------------------------------------------------------------------
+
+TOOL_PREFIX = "study_"
+TOOL_EXCLUDED_COMMANDS = ("init", "tools")  # setup and the tool layer itself are not offered to agents
+TOOL_GLOBAL_DESTS = ("root", "study_dir", "agent", "json_out", "max_event_bytes", "help", "version")
+TOOL_GLOBAL_OPTIONS = (("root", "--root"), ("study_dir", "--study-dir"), ("agent", "--agent"),
+                       ("max_event_bytes", "--max-event-bytes"))
+
+
+def _parser_children(parser: argparse.ArgumentParser) -> Optional[Dict[str, argparse.ArgumentParser]]:
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return dict(action.choices)
+    return None
+
+
+def _parser_leaves(parser: argparse.ArgumentParser, path: Tuple[str, ...] = ()) -> Iterator[
+        Tuple[Tuple[str, ...], argparse.ArgumentParser]]:
+    children = _parser_children(parser)
+    if children is None:
+        yield path, parser
+        return
+    for name, child in children.items():
+        yield from _parser_leaves(child, path + (name,))
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    return text[:1].upper() + text[1:] + ("" if text.endswith(".") else ".")
+
+
+def tool_specs() -> List[Dict[str, Any]]:
+    """One spec per exposed command: name, description, JSON Schema, and how arguments map back to argv."""
+    specs: List[Dict[str, Any]] = []
+    for path, leaf_parser in _parser_leaves(build_parser()):
+        if not path or path[0] in TOOL_EXCLUDED_COMMANDS:
+            continue
+        params: List[Dict[str, Any]] = []
+        for act in leaf_parser._actions:
+            if act.dest in TOOL_GLOBAL_DESTS or isinstance(act, (argparse._HelpAction, argparse._VersionAction)):
+                continue
+            positional = not act.option_strings
+            is_bool = isinstance(act, argparse._StoreTrueAction)
+            is_list = (not is_bool) and (act.nargs in ("+", "*") or isinstance(act, argparse._AppendAction))
+            prop: Dict[str, Any] = {}
+            if is_bool:
+                prop["type"] = "boolean"
+            elif is_list:
+                prop["type"] = "array"
+                prop["items"] = {"type": "string"}
+                if act.nargs == "+":
+                    prop["minItems"] = 1
+            elif act.type is int:
+                prop["type"] = "integer"
+            else:
+                prop["type"] = "string"
+            if act.choices:
+                prop["enum"] = list(act.choices)
+            if act.help:
+                prop["description"] = act.help
+            if act.default is not None and act.default is not argparse.SUPPRESS and not is_bool:
+                prop["default"] = act.default
+            required = (positional and act.nargs in (None, "+")) or bool(getattr(act, "required", False) and not positional)
+            params.append({
+                "name": act.dest, "schema": prop, "required": required, "positional": positional,
+                "flag": None if positional else max(act.option_strings, key=len),
+                "kind": "bool" if is_bool else "list" if is_list else "int" if act.type is int else "str",
+            })
+        params.sort(key=lambda p: not p["positional"])  # positionals first, otherwise declaration order
+        specs.append({
+            "name": TOOL_PREFIX + "_".join(path).replace("-", "_"),
+            "path": list(path),
+            "description": _sentence(leaf_parser.description or " ".join(path)),
+            "params": params,
+        })
+    names = [sp["name"] for sp in specs]
+    if len(set(names)) != len(names):
+        raise KitError("internal error: duplicate tool names")
+    return specs
+
+
+def tool_input_schema(spec: Dict[str, Any]) -> Dict[str, Any]:
+    return {"type": "object",
+            "properties": {p["name"]: p["schema"] for p in spec["params"]},
+            "required": [p["name"] for p in spec["params"] if p["required"]],
+            "additionalProperties": False}
+
+
+def tool_definitions(fmt: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for spec in tool_specs():
+        schema = tool_input_schema(spec)
+        if fmt == "openai":
+            out.append({"type": "function", "function": {"name": spec["name"], "description": spec["description"],
+                                                         "parameters": schema}})
+        else:
+            out.append({"name": spec["name"], "description": spec["description"], "input_schema": schema})
+    return out
+
+
+def tool_argv(spec: Dict[str, Any], arguments: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Validate JSON arguments against the tool's schema and turn them into an argv list (no shell involved)."""
+    known = {p["name"]: p for p in spec["params"]}
+    for key in arguments:
+        if key not in known:
+            raise KitError("%s has no argument %r (arguments: %s)" % (spec["name"], key, ", ".join(known) or "none"))
+    options: List[str] = []
+    positionals: List[str] = []
+    for p in spec["params"]:
+        name = p["name"]
+        if name not in arguments or arguments[name] is None:
+            if p["required"]:
+                raise KitError("%s needs argument %r" % (spec["name"], name))
+            continue
+        value = arguments[name]
+        kind = p["kind"]
+        if kind == "bool":
+            if not isinstance(value, bool):
+                raise KitError("argument %r must be true or false" % name)
+        elif kind == "int":
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise KitError("argument %r must be an integer" % name)
+        elif kind == "list":
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise KitError("argument %r must be a list of strings" % name)
+            if not value and p["schema"].get("minItems"):
+                raise KitError("argument %r needs at least one item" % name)
+        elif not isinstance(value, str):
+            raise KitError("argument %r must be a string" % name)
+        if "enum" in p["schema"]:
+            for item in (value if kind == "list" else [value]):
+                if item not in p["schema"]["enum"]:
+                    raise KitError("argument %r must be one of: %s" % (name, ", ".join(map(str, p["schema"]["enum"]))))
+        items = [str(v) for v in value] if kind == "list" else [str(value)]
+        if p["positional"]:
+            positionals.extend(items)
+        elif kind == "bool":
+            if value:
+                options.append(p["flag"])
+        else:
+            options.extend("%s=%s" % (p["flag"], item) for item in items)  # '=' keeps values that start with '-'
+    return list(spec["path"]) + options, positionals
+
+
+def cmd_tools(ctx: Context, args: argparse.Namespace) -> int:
+    if args.tools_cmd == "list":
+        ctx.out.write(json.dumps(tool_definitions(args.format), indent=2) + "\n")
+        return 0
+    specs = {sp["name"]: sp for sp in tool_specs()}
+
+    def envelope(ok: bool, code: int, output: Any, error: str) -> int:
+        ctx.emit_json({"ok": ok, "exit_code": code, "output": output, "error": error})
+        return code
+
+    spec = specs.get(args.tool)
+    if spec is None:
+        return envelope(False, 1, None, "unknown tool %r (see: tools list)" % args.tool)
+    try:
+        raw = sys.stdin.read() if args.args == "-" else args.args
+        try:
+            arguments = json.loads(raw)
+        except ValueError as exc:
+            raise KitError("--args is not valid JSON: %s" % exc)
+        if not isinstance(arguments, dict):
+            raise KitError("--args must be a JSON object")
+        head, positionals = tool_argv(spec, arguments)
+    except KitError as exc:
+        return envelope(False, 1, None, str(exc))
+    command = head[:len(spec["path"])]
+    options = head[len(spec["path"]):]
+    for dest, flag in TOOL_GLOBAL_OPTIONS:
+        value = getattr(args, dest, None)
+        if value is not None:
+            options.append("%s=%s" % (flag, value))
+    argv = command + options + ["--json"] + (["--"] + positionals if positionals else [])
+    out_buf, err_buf = io.StringIO(), io.StringIO()
+    code = main(argv, stdout=out_buf, stderr=err_buf)
+    text = out_buf.getvalue()
+    try:
+        output: Any = json.loads(text)
+    except ValueError:
+        output = text.rstrip("\n")
+    return envelope(code == 0, code, output, err_buf.getvalue().strip())
+
+
 TOP_EPILOG = """\
 examples:
   python kernel.py init --root /path/to/repo
@@ -3387,6 +3589,8 @@ examples:
   python .study/kernel.py codebase add --detected
   python .study/kernel.py search token expiry
   python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry points"
+  python .study/kernel.py tools list --format openai          # the commands as agent tool definitions
+  python .study/kernel.py tools call study_status --args '{}' # run one tool from JSON, get a JSON result
 
 global options (accepted before or after the command): --root, --study-dir, --agent, --json,
 --max-event-bytes. Errors print 'error: <message>' on stderr and exit 1.
@@ -3550,6 +3754,18 @@ def build_parser() -> argparse.ArgumentParser:
              "python .study/kernel.py coverage --depth 2")
     q.add_argument("--depth", type=int, default=1, help="directory grouping depth (default 1)")
 
+    p = sub.add_parser("tools", help="export the commands as agent tool definitions, or call one from JSON")
+    tsub = p.add_subparsers(dest="tools_cmd", metavar="ACTION")
+    tsub.required = True
+    q = leaf(tsub, "list", "print tool definitions as a JSON array (no study directory needed)",
+             "python .study/kernel.py tools list --format openai")
+    q.add_argument("--format", choices=("anthropic", "openai"), default="anthropic",
+                   help="anthropic: name/description/input_schema (default); openai: function wrapper")
+    q = leaf(tsub, "call", "run one tool from JSON arguments and print a JSON result envelope",
+             "python .study/kernel.py tools call study_finding --args '{\"title\": \"T\", \"severity\": \"low\", \"run\": \"RUN-0001\"}'")
+    q.add_argument("tool", help="tool name from 'tools list', e.g. study_status")
+    q.add_argument("--args", default="{}", help="JSON object of arguments, or - to read it from stdin")
+
     leaf(sub, "check", "validate records, anchors and index rebuildability", "python .study/kernel.py check --json")
     leaf(sub, "rebuild", "atomically rebuild the disposable index", "python .study/kernel.py rebuild")
     leaf(sub, "status", "summarize study state and items needing attention", "python .study/kernel.py status")
@@ -3570,6 +3786,8 @@ def dispatch_key(args: argparse.Namespace) -> str:
         return "claim:" + args.claim_cmd
     if cmd == "codebase":
         return "codebase:" + args.codebase_cmd
+    if cmd == "tools":
+        return "tools:" + args.tools_cmd
     return cmd
 
 
@@ -3578,7 +3796,7 @@ HANDLERS = {
     "finding": cmd_finding, "anchor:add": cmd_anchor_add, "claim:add": cmd_claim_add, "set": cmd_set, "orient": cmd_orient, "evidence:add": cmd_evidence_add,
     "show": cmd_show, "list": cmd_list, "search": cmd_search, "graph": cmd_graph,
     "codebase:add": cmd_codebase, "codebase:remove": cmd_codebase, "codebase:list": cmd_codebase,
-    "codebase:scan": cmd_codebase,
+    "codebase:scan": cmd_codebase, "tools:list": cmd_tools, "tools:call": cmd_tools,
     "coverage": cmd_coverage, "check": cmd_check, "rebuild": cmd_rebuild, "status": cmd_status,
 }
 
@@ -3598,7 +3816,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: Any = None, stderr: Any =
     try:
         args = build_parser().parse_args(argv)
         key = dispatch_key(args)
-        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient", "codebase:scan")))
+        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient", "codebase:scan", "tools:list", "tools:call")))
         return int(HANDLERS[key](ctx, args) or 0)
     except KitError as exc:
         print("error: %s" % exc, file=err)

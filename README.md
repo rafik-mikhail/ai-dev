@@ -151,8 +151,26 @@ python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry point
 | `check` | Validate records, anchors and index rebuildability |
 | `rebuild` | Rebuild `study.db` from the durable records |
 | `status` | Counts, open runs, anchor states, items needing attention |
+| `tools list\|call` | Export the commands as agent tool definitions; run one from JSON arguments (see below) |
 
 Global options: `--root`, `--study-dir`, `--agent` (or `STUDY_AGENT`), `--json`, `--max-event-bytes`. `STUDY_DISABLE_FTS=1` forces the non-FTS search path. Errors print `error: ...` to stderr and exit 1. The operating rules are in `.study/PROTOCOL.md`; a walkthrough is in `examples/minimal/README.md`.
+
+### As agent tools
+
+Agents with a shell run the commands above. For a harness that wants typed tool calls instead (Claude, OpenAI function calling, MCP wrappers, your own loop), the kernel exports its commands as tool definitions and can run one from JSON, with no shell involved:
+
+```bash
+python .study/kernel.py tools list                    # JSON array: name, description, input_schema
+python .study/kernel.py tools list --format openai    # {"type": "function", "function": {...}}
+python .study/kernel.py tools call study_finding --args '{"title": "Expiry not checked", "severity": "medium", "anchor": ["ANC-0001"], "run": "RUN-0001"}'
+echo '{"words": ["token"]}' | python .study/kernel.py tools call study_search --args -
+```
+
+- There is one tool per command, named `study_` plus the command path: `study_run_start`, `study_finding`, `study_set`, `study_claim_add`, `study_codebase_add`, and so on, 22 in all. They are generated from the kernel's own argument parser, so they cannot drift from the CLI. `init` and `tools` are not offered.
+- Argument names are the long option names with underscores (`start_line`, `open_question`). Options that repeat take a JSON array. Positional arguments, such as `document_id` and `text`, are plain properties.
+- `tools call` validates the arguments against the schema, runs the command with `--json`, and always prints one envelope: `{"ok": true, "exit_code": 0, "output": ..., "error": ""}`. `output` is the command's JSON, or its text when the command has no JSON form. Validation failures and unknown tools use the same envelope with `ok: false`. Exit codes mirror the command's.
+- Values are passed as separate arguments, never through a shell, so quotes, newlines and leading dashes in titles and claims are safe. `--root`, `--study-dir`, `--agent` and `--max-event-bytes` given to `tools call` are passed through; they are not tool arguments, so the model cannot redirect the kernel.
+- Giving an agent only these tools, with no general shell, is a way to let it record study notes without being able to edit source. This narrows what the agent can do, but it is not a sandbox: the harness has to enforce that the agent has no other way to touch the files.
 
 ## Methodology
 
@@ -172,6 +190,7 @@ The full rules, vocabulary and record formats are in [PROTOCOL.md](src/emkit/res
 - Markdown and JSONL are the source of truth. `study.db` can be deleted and rebuilt at any time.
 - Anchors prove provenance, not correctness. `ok` means the file, symbol text and fingerprint still match, not that a claim is true.
 - Stale and missing anchors are warnings (exit 0). Malformed records, duplicate IDs, unknown links and invalid evidence are errors (exit 1).
+- Records, templates and logs checked out with CRLF line endings, or saved with a BOM, are read normally. The kernel writes LF.
 - `verified` confidence is reserved and rejected in V0.
 - Findings are closed by observation, never by inference. `resolved` (the problem is gone), `obsolete` (the code was removed or rewritten) and `dismissed` (not a problem) all need a note, and the first two need evidence from a re-inspection in the same run; the log records the commit the source was at. When a finding's anchors drift, `check` and `status` flag it as `finding-needs-recheck`. The kernel never closes a finding by itself, and there is no `fixed` status because Study mode cannot know who fixed what.
 - `run end` compares Git HEAD and working-tree state with the run's start snapshot and marks the run `source_changed` if they differ.

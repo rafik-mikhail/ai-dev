@@ -31,7 +31,7 @@ Layout installed by `init`:
 
 Install with `emkit init PATH` (preferred; also writes `.study/VERSION` and the root `AGENTS.md`) or with the packaged `kernel.py init --root PATH`. Either way `.study/kernel.py` is a standalone copy: it needs only Python and never imports the `emkit` package.
 
-`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To keep the knowledge in version control, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns to the same file (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`). Those appends, and the marked Study block that `emkit init` adds to the root `AGENTS.md`, are the only writes the tools make outside `.study/`.
+`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To version the knowledge, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`) to the same file. Those appends and the marked block `emkit init` adds to the root `AGENTS.md` are the only writes outside `.study/`.
 
 ## 3. Artifacts and IDs
 
@@ -83,7 +83,7 @@ python .study/kernel.py set SYS-auth --status reviewed --confidence observed --r
 | finding | `open`, `triaged`, `resolved`, `obsolete`, `dismissed` |
 | system, flow | `draft`, `reviewed`, `deprecated` |
 
-`dismissed`, `resolved`, `obsolete` and `deprecated` require `--note`. `--confidence` accepts only `hypothesis`, `inferred` or `observed`; the reserved levels are refused. Every change is appended to a `## Status log` section in the document (timestamp, agent, run, old and new value, note), so the history is durable Markdown, not just cold events. Runs cannot be changed with `set`; their status is managed by `run start` and `run end`. There is no `fixed` status: V0 cannot know who fixed what, so `resolved` records an observation.
+`dismissed`, `resolved`, `obsolete` and `deprecated` require `--note`. `--confidence` accepts only `hypothesis`, `inferred` or `observed`; the reserved levels are refused. Every change is appended to a `## Status log` section in the document (timestamp, agent, run, old and new value, note). Runs cannot be changed with `set`; their status is managed by `run start` and `run end`. There is no `fixed` status: V0 cannot know who fixed what, so `resolved` records an observation.
 
 ### Finding lifecycle
 
@@ -135,8 +135,8 @@ When the study root holds several repositories, register the ones in scope: `cod
 
 ## 6. Study workflow
 
-1. Orient: `status`, then `list` and `search WORD ...` to reuse existing records before reading the code broadly. On a repository you have not seen, run `orient` first (section 10).
-2. Start: `run start --goal "..."`. Record the printed `RUN-NNNN`. A run snapshots Git HEAD and working-tree state.
+1. Orient: `status`, then `list` and `search WORD ...` to reuse existing records before reading code broadly. On an unfamiliar repository, run `orient` first.
+2. Start: `run start --goal "..."`. Note the printed `RUN-NNNN`; the run snapshots Git state.
 3. Map: `new system SLUG --title ... --area PATH --run RUN-NNNN`.
 4. Trace: `new flow SLUG --title ... --run RUN-NNNN`.
 5. Investigate and anchor: `anchor add DOC_ID PATH [--symbol NAME] [--start-line N --end-line N] --run RUN-NNNN`. Then edit the document body to describe what you saw, citing `ANC-` and `EV-` IDs.
@@ -146,7 +146,7 @@ When the study root holds several repositories, register the ones in scope: `cod
 
 Evidence types: `source-inspection`, `configuration-inspection`, `test-run`, `static-analysis`, `runtime-observation`, `manual-reproduction`. The `--command` text is recorded only; the kernel never runs it. If you ran a command yourself, record it and its exit code, and say what you did not inspect in `--limitation`.
 
-Hand-editing is allowed in Markdown bodies for the prose sections the templates mark as agent-written (Purpose, Steps, Conclusions, Limitations, Not inspected, and so on). Use the commands for everything that has one: claims (`claim add`), status and confidence (`set`), anchors, evidence. Do not hand-edit frontmatter IDs, claim IDs, the `study:anchors` block, the Status log, `evidence.jsonl`, or `events.jsonl`; `check` will flag malformed records.
+You may hand-edit the prose sections the templates mark as agent-written (Purpose, Steps, Conclusions, Limitations, Not inspected, and so on). Use the commands for everything that has one: claims (`claim add`), status and confidence (`set`), anchors, evidence. Do not hand-edit frontmatter IDs, claim IDs, the `study:anchors` block, the Status log, `evidence.jsonl`, or `events.jsonl`; `check` will flag malformed records.
 
 Writing rules for technical text:
 
@@ -165,7 +165,7 @@ Kernel-level guarantees:
 - `run start` snapshots Git HEAD and porcelain status (study directory excluded). `run end` compares. If anything differs, the run is marked `source_changed`, the command exits non-zero, and the diff (state only, no file contents) is printed. Pre-existing dirty state that is unchanged at the end is tolerated.
 - Without Git there is no source-change guard; the kernel says so.
 
-The agent rules are stricter than the kernel's: do not modify target source, tests, configuration, Git state or hooks, and write study records only through `kernel.py` wherever a command exists. These kernel guardrails constrain `kernel.py`. They do not constrain an agent that also has a general shell or filesystem tool. Real enforcement needs the isolation described in section 11.
+The agent rules are stricter than the kernel's: do not modify target source, tests, configuration, Git state or hooks, and write study records only through `kernel.py` wherever a command exists. These kernel guardrails constrain `kernel.py`. They do not constrain an agent that also has a general shell or filesystem tool. Real enforcement needs section 11's isolation.
 
 ## 8. Logging and privacy
 
@@ -179,16 +179,18 @@ The agent rules are stricter than the kernel's: do not modify target source, tes
 
 `study.db` is derived state: documents, anchors, links, runs, evidence, event metadata, and an FTS5 table when SQLite has it (otherwise search uses `LIKE`). Rebuild runs in a single transaction. A parse error, duplicate ID or injected failure leaves the previous database usable. `check` also builds the index in memory to prove it can be rebuilt. If deleting `study.db` would lose knowledge, that is a bug.
 
-Search matches document titles and bodies with AND semantics across words. Body text excludes HTML comments, so template instructions are not indexed. It does not search events.
+Search matches document titles and bodies with AND semantics across words. Body text excludes HTML comments, so template instructions are not indexed.
 
 ## 10. Commands, exit codes and output
 
 ```text
-init  orient  run start|end  new system|flow  finding  claim add  set
-anchor add  evidence add  show  list  search  graph  coverage  check  rebuild  status
+init  orient  run start|end  new system|flow  finding  claim add  set  codebase add|remove|list|scan
+anchor add  evidence add  show  list  search  graph  coverage  check  rebuild  status  tools list|call
 ```
 
-`orient` surveys the repository: file count, languages by extension, build tools by marker file, test directories and test-named files, entry-point candidates by filename convention (plus `main`/`bin`/`scripts` keys from a root `package.json`), root docs, CI files, and top-level directory sizes, alongside the current study counts. It excludes the same directories as `coverage`. Its output is filename and layout heuristics: candidates to investigate, never evidence that code does anything. Anchor what you rely on.
+`tools list [--format anthropic|openai]` prints every command except `init` as a JSON tool definition (`study_` plus the command path), generated from the argument parser. `tools call NAME --args JSON` validates the arguments, runs the command with `--json` and no shell, and prints `{ok, exit_code, output, error}`.
+
+`orient` surveys the repository: file count, languages by extension, build tools by marker file, test directories and files, entry-point candidates by filename convention (plus `main`/`bin`/`scripts` keys from a root `package.json`), root docs, CI files and top-level directory sizes. It excludes the same directories as `coverage`. The output is layout heuristics: candidates to investigate, never evidence that code does anything.
 
 Global options: `--root PATH`, `--study-dir PATH`, `--agent NAME` (or `STUDY_AGENT`), `--json`, `--max-event-bytes N`. Set `STUDY_DISABLE_FTS=1` to force the fallback search path. Errors go to stderr as `error: ...` with exit 1. With `--json`, stdout carries only JSON; warnings go to stderr. `coverage` is descriptive: anchored does not mean understood or correct. `init` refuses to overwrite existing kit files without `--force`, and never overwrites durable records.
 

@@ -932,6 +932,255 @@ class TestFindingLifecycle(KitCase):
         self.assertEqual(status["open_findings"]["high"], 0)
 
 
+EXPECTED_TOOLS = (
+    "study_run_start", "study_run_end", "study_new_system", "study_new_flow", "study_finding", "study_claim_add",
+    "study_set", "study_orient", "study_anchor_add", "study_codebase_add", "study_codebase_remove",
+    "study_codebase_list", "study_codebase_scan", "study_evidence_add", "study_show", "study_list",
+    "study_search", "study_graph", "study_coverage", "study_check", "study_rebuild", "study_status")
+
+
+class TestTools(KitCase):
+    """Commands exported as agent tool definitions; `tools call` runs one from JSON without a shell."""
+
+    def call(self, name, arguments=None, raw=None):
+        res = self.k("tools", "call", name, "--args", raw if raw is not None else json.dumps(arguments or {}))
+        env = res.json()
+        self.assertEqual(set(env), {"ok", "exit_code", "output", "error"})
+        self.assertEqual(res.rc, env["exit_code"])
+        self.assertEqual(env["ok"], env["exit_code"] == 0)
+        return env
+
+    def test_t01_list_needs_no_study_directory_and_covers_every_command(self):
+        res = self.k("tools", "list", ok=True)
+        self.assertFalse(self.study.exists())
+        tools = json.loads(res.out)
+        self.assertEqual(tuple(t["name"] for t in tools), EXPECTED_TOOLS)
+        for t in tools:
+            self.assertEqual(set(t), {"name", "description", "input_schema"})
+            self.assertTrue(t["description"].endswith("."), t["name"])
+            schema = t["input_schema"]
+            self.assertEqual(schema["type"], "object")
+            self.assertFalse(schema["additionalProperties"])
+            self.assertTrue(set(schema["required"]) <= set(schema["properties"]))
+            for prop in schema["properties"].values():
+                self.assertIn(prop["type"], ("string", "integer", "boolean", "array"))
+        self.assertNotIn("study_init", EXPECTED_TOOLS)
+        self.assertFalse(any(n.startswith("study_tools") for n in EXPECTED_TOOLS))
+
+    def test_t02_schemas_match_the_cli(self):
+        tools = {t["name"]: t["input_schema"] for t in json.loads(self.k("tools", "list", ok=True).out)}
+        finding = tools["study_finding"]
+        self.assertEqual(set(finding["required"]), {"title", "severity", "run"})
+        self.assertEqual(finding["properties"]["severity"]["enum"], list(kernel.SEVERITIES))
+        self.assertEqual(finding["properties"]["anchor"]["type"], "array")
+        self.assertEqual(tools["study_search"]["properties"]["limit"]["type"], "integer")
+        self.assertEqual(tools["study_search"]["properties"]["limit"]["default"], 20)
+        self.assertEqual(tools["study_claim_add"]["properties"]["inference"]["type"], "boolean")
+        self.assertEqual(set(tools["study_set"]["required"]), {"id", "run"})
+        self.assertIn("resolved", tools["study_set"]["properties"]["status"]["description"])
+        self.assertEqual(tools["study_status"]["properties"], {})
+        for name, schema in tools.items():
+            for key in schema["properties"]:
+                self.assertNotIn(key, ("root", "study_dir", "agent", "json_out", "max_event_bytes"), name)
+
+    def test_t03_openai_format(self):
+        anthropic = json.loads(self.k("tools", "list", ok=True).out)
+        openai = json.loads(self.k("tools", "list", "--format", "openai", ok=True).out)
+        self.assertEqual(len(openai), len(anthropic))
+        for a, o in zip(anthropic, openai):
+            self.assertEqual(o["type"], "function")
+            self.assertEqual(o["function"], {"name": a["name"], "description": a["description"],
+                                             "parameters": a["input_schema"]})
+
+    def test_t04_call_runs_a_full_study_loop(self):
+        self.init()
+        env = self.call("study_run_start", {"goal": "Map auth"})
+        self.assertTrue(env["ok"], env)
+        run = env["output"]["id"]
+        self.assertEqual(run, "RUN-0001")
+        self.assertTrue(self.call("study_new_system", {"slug": "auth", "title": "Auth", "run": run})["ok"])
+        env = self.call("study_anchor_add", {"document_id": "SYS-auth", "path": "src/auth.py",
+                                             "symbol": "verify_token", "start_line": 4, "end_line": 7, "run": run})
+        self.assertTrue(env["ok"], env)
+        env = self.call("study_evidence_add", {"subject": "SYS-auth", "type": "source-inspection",
+                                               "result": "read verify_token", "anchor": ["ANC-0001"],
+                                               "limitation": ["callers not read", "tests not read"], "run": run})
+        self.assertTrue(env["ok"], env)
+        env = self.call("study_claim_add", {"document_id": "SYS-auth", "text": "verify_token rejects empty input",
+                                            "anchor": ["ANC-0001"], "evidence": ["EV-0001"], "inference": True,
+                                            "run": run})
+        self.assertTrue(env["ok"], env)
+        self.assertIn("Inference: verify_token rejects empty input", self.read("systems/auth.md"))
+        env = self.call("study_finding", {"title": "No expiry", "severity": "high", "anchor": ["ANC-0001"],
+                                          "run": run})
+        self.assertTrue(env["ok"], env)
+        self.assertTrue(self.call("study_set", {"id": "F-0001", "status": "triaged", "run": run})["ok"])
+        env = self.call("study_check")
+        self.assertTrue(env["ok"], env)
+        env = self.call("study_run_end", {"id": run, "summary": "done", "next": "trace refresh",
+                                          "open_question": ["who calls it?", "is there a cache?"]})
+        self.assertTrue(env["ok"], env)
+        self.assertIn("status: triaged", self.read("findings/F-0001.md"))
+        self.assertEqual(self.k("check").rc, 0)
+
+    def test_t05_output_matches_the_cli_json(self):
+        self.ready()
+        env = self.call("study_list", {"kind": "system"})
+        self.assertEqual(env["output"], self.k("list", "--kind", "system", "--json", ok=True).json())
+        env = self.call("study_search", {"words": ["Authentication"], "limit": 5})
+        self.assertEqual(env["output"], self.k("search", "Authentication", "--limit", "5", "--json", ok=True).json())
+        env = self.call("study_status")
+        self.assertIn("finding_status", env["output"])
+
+    def test_t06_values_are_never_parsed_as_options_or_shell(self):
+        run = self.ready()
+        nasty = "--not-a-flag; $(touch pwned) `id` \"quoted\" and\nnewline"
+        env = self.call("study_claim_add", {"document_id": "SYS-auth", "text": "-- leading dashes ok",
+                                            "anchor": ["ANC-0001"], "run": run})
+        self.assertTrue(env["ok"], env)
+        self.assertIn("-- leading dashes ok", self.read("systems/auth.md"))
+        env = self.call("study_finding", {"title": "- starts with a dash", "severity": "low", "run": run})
+        self.assertTrue(env["ok"], env)
+        self.assertIn("- starts with a dash", self.read("findings/F-0001.md"))
+        env = self.call("study_run_end", {"id": run, "summary": nasty})
+        self.assertFalse((self.root / "pwned").exists())
+        self.assertFalse(Path("pwned").exists())
+
+    def test_t07_bad_calls_return_an_envelope_and_change_nothing(self):
+        run = self.ready()
+        before = {p.relative_to(self.study).as_posix(): p.read_bytes()
+                  for p in self.study.rglob("*") if p.is_file() and p.suffix in (".md", ".jsonl")}
+        cases = [
+            ("study_nope", {}, "unknown tool"),
+            ("study_init", {}, "unknown tool"),
+            ("study_finding", {"title": "x", "run": run}, "needs argument 'severity'"),
+            ("study_finding", {"title": "x", "severity": "urgent", "run": run}, "must be one of"),
+            ("study_finding", {"title": "x", "severity": "low", "run": run, "bogus": 1}, "no argument 'bogus'"),
+            ("study_finding", {"title": 5, "severity": "low", "run": run}, "must be a string"),
+            ("study_finding", {"title": "x", "severity": "low", "run": run, "anchor": "ANC-0001"},
+             "list of strings"),
+            ("study_finding", {"title": "x", "severity": "low", "run": run, "anchor": []}, "at least one"),
+            ("study_search", {"words": ["a"], "limit": "3"}, "must be an integer"),
+            ("study_search", {"words": ["a"], "limit": True}, "must be an integer"),
+            ("study_claim_add", {"document_id": "SYS-auth", "text": "t", "run": run, "inference": "yes"},
+             "true or false"),
+        ]
+        for name, arguments, expect in cases:
+            env = self.call(name, arguments)
+            self.assertFalse(env["ok"], (name, arguments))
+            self.assertEqual(env["exit_code"], 1)
+            self.assertIsNone(env["output"])
+            self.assertIn(expect, env["error"], (name, arguments))
+        for raw, expect in (("not json", "not valid JSON"), ("[]", "JSON object"), ('"x"', "JSON object")):
+            env = self.call("study_status", raw=raw)
+            self.assertFalse(env["ok"])
+            self.assertIn(expect, env["error"])
+        after = {p.relative_to(self.study).as_posix(): p.read_bytes()
+                 for p in self.study.rglob("*") if p.is_file() and p.suffix in (".md", ".jsonl")}
+        self.assertEqual(before.keys(), after.keys())
+        for key in before:
+            if not key.endswith("events.jsonl"):
+                self.assertEqual(before[key], after[key], key)
+
+    def test_t08_kernel_errors_are_reported_in_the_envelope(self):
+        self.ready()
+        env = self.call("study_set", {"id": "F-0099", "status": "triaged", "run": "RUN-0001"})
+        self.assertFalse(env["ok"])
+        self.assertEqual(env["exit_code"], 1)
+        self.assertIn("unknown document", env["error"])
+        env = self.call("study_run_end", {"id": "RUN-0042", "summary": "s"})
+        self.assertFalse(env["ok"])
+
+    def test_t09_global_options_are_not_tool_arguments_but_pass_through(self):
+        run = self.ready()
+        env = self.call("study_status", {"root": str(self.root)})
+        self.assertFalse(env["ok"])  # a model cannot redirect the kernel
+        self.call("study_new_flow", {"slug": "login", "title": "Login", "run": run})
+        self.assertIn("updated_by: tester", self.read("flows/login.md"))  # --agent given to tools call is honored
+
+    def test_t10_args_from_stdin(self):
+        self.ready()
+        saved = sys.stdin
+        sys.stdin = io.StringIO(json.dumps({"words": ["Authentication"]}))
+        try:
+            res = self.k("tools", "call", "study_search", "--args", "-", ok=True)
+        finally:
+            sys.stdin = saved
+        self.assertEqual(res.json()["output"][0]["id"], "SYS-auth")
+
+    def test_t11_workspace_tools(self):
+        self.init()
+        env = self.call("study_codebase_scan")
+        self.assertTrue(env["ok"], env)
+        env = self.call("study_codebase_list")
+        self.assertTrue(env["ok"], env)
+        self.assertIsInstance(env["output"], (dict, list))
+        env = self.call("study_codebase_remove", {"path": "nowhere"})
+        self.assertFalse(env["ok"])
+        self.assertTrue(env["error"])
+
+
+class TestLineEndings(KitCase):
+    """Records, templates and index files must survive CRLF checkouts (Windows, core.autocrlf)."""
+
+    def to_crlf(self, *globs, bom=False):
+        for pattern in globs:
+            for path in self.study.glob(pattern):
+                data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+                path.write_bytes((b"\xef\xbb\xbf" if bom else b"") + data)
+
+    def populate(self):
+        run = self.ready()
+        self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "r",
+               "--anchor", "ANC-0001", "--run", run, ok=True)
+        self.k("claim", "add", "SYS-auth", "verify_token rejects empty input", "--anchor", "ANC-0001", "--run", run,
+               ok=True)
+        self.k("finding", "No expiry", "--severity", "high", "--anchor", "ANC-0001", "--run", run, ok=True)
+        self.k("new", "flow", "login", "--title", "Login", "--run", run, ok=True)
+        self.end_run(run)
+
+    def test_l01_crlf_records_are_read_edited_and_indexed(self):
+        self.populate()
+        self.to_crlf("systems/*.md", "flows/*.md", "findings/*.md", "runs/*/summary.md", "runs/*/*.jsonl")
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+        self.k("rebuild", ok=True)
+        self.assertIn("SYS-auth", self.k("search", "Authentication", ok=True).out)
+        self.assertEqual(len(self.k("list", "--json", ok=True).json()), 4)
+        run = self.start_run("second")
+        self.k("claim", "add", "SYS-auth", "a second claim", "--anchor", "ANC-0001", "--run", run, ok=True)
+        self.k("set", "F-0001", "--status", "triaged", "--run", run, ok=True)
+        self.k("anchor", "add", "SYS-auth", "src/auth.py", "--start-line", "1", "--end-line", "3", "--run", run, ok=True)
+        self.k("evidence", "add", "F-0001", "--type", "source-inspection", "--result", "r2", "--run", run, ok=True)
+        self.end_run(run)
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+        self.assertIn("CLM-0002", self.read("systems/auth.md"))
+
+    def test_l02_bom_and_lone_cr_documents(self):
+        self.populate()
+        self.to_crlf("systems/*.md", "findings/*.md", bom=True)
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+        path = self.study / "flows" / "login.md"
+        path.write_bytes(path.read_bytes().replace(b"\n", b"\r"))  # classic Mac line endings
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+
+    def test_l03_crlf_templates_render(self):
+        self.init()
+        self.to_crlf("templates/*.md")
+        run = self.start_run()
+        self.k("new", "system", "auth", "--title", "Auth", "--run", run, ok=True)
+        self.k("new", "flow", "login", "--title", "Login", "--run", run, ok=True)
+        self.k("finding", "x", "--severity", "low", "--run", run, ok=True)
+        self.end_run(run)
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+
+    def test_l04_failed_run_start_leaves_no_stub(self):
+        self.init()
+        self.write("templates/run.md", "not a template\n")
+        self.k("run", "start", "--goal", "g", ok=False)
+        self.assertEqual(sorted(p.name for p in (self.study / "runs").iterdir()), [])
+        self.assertEqual(self.k("check").rc, 0, self.k("check").err)
+
+
 class TestOrient(KitCase):
     def populate(self):
         files = {
@@ -1237,7 +1486,7 @@ class TestKitHygiene(unittest.TestCase):
     def test_30_stdlib_only_and_python39_syntax(self):
         src = (PKG / "kernel.py").read_text(encoding="utf-8")
         tree = ast.parse(src, feature_version=(3, 9))
-        allowed = {"__future__", "argparse", "contextlib", "dataclasses", "datetime", "hashlib", "json", "os",
+        allowed = {"__future__", "argparse", "contextlib", "dataclasses", "datetime", "hashlib", "io", "json", "os",
                    "re", "sqlite3", "subprocess", "sys", "tempfile", "pathlib", "typing"}
         imported = set()
         for node in ast.walk(tree):
