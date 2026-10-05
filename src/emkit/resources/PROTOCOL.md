@@ -31,7 +31,7 @@ Layout installed by `init`:
 
 Install with `emkit init PATH` (preferred; also writes `.study/VERSION` and the root `AGENTS.md`) or with the packaged `kernel.py init --root PATH`. Either way `.study/kernel.py` is a standalone copy: it needs only Python and never imports the `emkit` package.
 
-`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To keep the knowledge in version control, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns to the same file (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`). Those appends are the only writes the tools make outside `.study/` (plus the root `AGENTS.md` from `emkit init`).
+`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To keep the knowledge in version control, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns to the same file (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`). Those appends, and the marked Study block that `emkit init` adds to the root `AGENTS.md`, are the only writes the tools make outside `.study/`.
 
 ## 3. Artifacts and IDs
 
@@ -112,6 +112,16 @@ Limits you must keep in mind:
 - Stale and missing anchors are warnings, so `check` still exits 0. Structural problems are errors and exit 1.
 - Without Git, freshness rests on fingerprints alone, and `check` says so.
 - Moving code without keeping its location and fingerprint is reported `stale`, never `ok`.
+
+### Several codebases under one study root
+
+When the study root is a folder that holds several repositories, register the ones in scope: `codebase scan` finds candidates, `codebase add PATH` registers one, `codebase remove PATH` unregisters it (records stay), `codebase list` shows each one's HEAD and working-tree state. The registry is `.study/codebases.json`. With nothing registered, the root is the single codebase and nothing below applies.
+
+- An anchor must fall inside a registered codebase. Its `path` stays relative to the study root, its `repository` field names the codebase, and its `commit` is that repository's HEAD.
+- Freshness is judged against the anchor's own repository, and `run start` / `run end` snapshot every registered codebase separately. A change in any one marks the run `source_changed` and names it.
+- Unregistered folders are outside the study: they cannot be anchored and are ignored by `orient` and `coverage`.
+- The map cannot change while a run is open. Removing a codebase keeps its anchors, and `check` warns about anchors whose codebase is not registered.
+- Evidence takes its commit from the single codebase its anchors belong to; it is null when it cites anchors from several, or none.
 
 ## 6. Study workflow
 

@@ -883,6 +883,208 @@ class TestSectionHelper(unittest.TestCase):
         self.assertTrue(out5.endswith("## New\n\n- x\n"))
 
 
+@needs_git
+class TestWorkspaceMode(KitCase):
+    """Several repositories under one study root: a registry of codebases, per-codebase Git state."""
+
+    use_git = False
+
+    def setUp(self):
+        super().setUp()
+        # self.root is now a plain folder (no Git) that holds two repositories and a non-repo folder.
+        shutil.rmtree(str(self.root / "src"))
+        for name in ("api", "web"):
+            (self.root / name / "src").mkdir(parents=True)
+            shutil.copy(str(FIXTURE), str(self.root / name / "src" / "auth.py"))
+            git(self.root / name, "init", "-q")
+            git(self.root / name, "add", "-A")
+            git(self.root / name, "commit", "-qm", "fixture " + name)
+        (self.root / "notes").mkdir()
+        (self.root / "notes" / "todo.txt").write_text("not a repo\n", encoding="utf-8")
+
+    def head(self, name):
+        return git(self.root / name, "rev-parse", "HEAD").stdout.decode().strip()
+
+    def workspace(self):
+        self.init()
+        self.k("codebase", "add", "api", "web", ok=True)
+        run = self.start_run()
+        self.k("new", "system", "auth", "--title", "Authentication", "--run", run, ok=True)
+        return run
+
+    def test_w01_scan_finds_repos_without_registering(self):
+        self.init()
+        res = self.k("codebase", "scan", "--json", ok=True).json()
+        self.assertEqual([c["path"] for c in res["candidates"]], ["api", "web"])
+        self.assertFalse(any(c["registered"] for c in res["candidates"]))
+        self.assertFalse((self.study / "codebases.json").exists())
+        self.assertIn("single-repository mode", self.k("codebase", "list", ok=True).out)
+
+    def test_w02_add_remove_list_roundtrip(self):
+        self.init()
+        res = self.k("codebase", "add", "--detected", ok=True)
+        self.assertIn("registered api", res.out)
+        self.assertIn("already registered api", self.k("codebase", "add", "api", ok=True).out)
+        listed = self.k("codebase", "list", "--json", ok=True).json()
+        self.assertEqual(listed["mode"], "workspace")
+        self.assertEqual([c["path"] for c in listed["codebases"]], ["api", "web"])
+        self.assertEqual(listed["codebases"][0]["head"], self.head("api"))
+        removed = self.k("codebase", "remove", "web", ok=True)
+        self.assertIn("no files or records were deleted", removed.out)
+        self.assertTrue((self.root / "web" / "src" / "auth.py").is_file())
+        self.k("codebase", "remove", "web", ok=False)
+        self.k("codebase", "remove", "api", ok=True)
+        self.assertEqual(self.k("codebase", "list", "--json", ok=True).json()["mode"], "single")
+        obj = json.loads((self.study / "codebases.json").read_text(encoding="utf-8"))
+        self.assertEqual(obj["codebases"], [])
+
+    def test_w03_add_validation(self):
+        self.init()
+        self.k("codebase", "add", "notes", ok=False)  # not a Git work tree
+        self.assertIn("not a Git work tree", self.k("codebase", "add", "notes").err)
+        self.k("codebase", "add", "missing", ok=False)
+        self.k("codebase", "add", "../elsewhere", ok=False)
+        self.k("codebase", "add", ".study", ok=False)
+        self.k("codebase", "add", ok=False)
+        self.k("codebase", "add", str(self.root / "api"), ok=True)  # absolute path inside the root is fine
+        self.k("codebase", "add", "notes", "--no-git", ok=True)
+        rows = self.k("codebase", "list", "--json", ok=True).json()["codebases"]
+        self.assertEqual({r["path"]: r["git"] for r in rows}, {"api": True, "notes": False})
+
+    def test_w04_anchor_records_its_codebase_and_commit(self):
+        run = self.workspace()
+        self.k("anchor", "add", "SYS-auth", "api/src/auth.py", "--symbol", "verify_token",
+               "--start-line", "4", "--end-line", "7", "--run", run, ok=True)
+        self.k("anchor", "add", "SYS-auth", "web/src/auth.py", "--symbol", "verify_token",
+               "--start-line", "4", "--end-line", "7", "--run", run, ok=True)
+        anchors = {a["id"]: a for a in kernel.load_records(self._ctx(), evaluate=False).anchors}
+        self.assertEqual((anchors["ANC-0001"]["repository"], anchors["ANC-0001"]["commit"]), ("api", self.head("api")))
+        self.assertEqual((anchors["ANC-0002"]["repository"], anchors["ANC-0002"]["commit"]), ("web", self.head("web")))
+        self.assertEqual(self.problem_codes(self.k("check", "--json", ok=True)), {"run-open"})
+
+    def _ctx(self):
+        ns = kernel.build_parser().parse_args(["status", "--root", str(self.root)])
+        return kernel.build_context(ns, io.StringIO(), io.StringIO(), True)
+
+    def test_w05_anchor_outside_every_codebase_is_refused(self):
+        run = self.workspace()
+        res = self.k("anchor", "add", "SYS-auth", "notes/todo.txt", "--run", run, ok=False)
+        self.assertIn("not inside a registered codebase", res.err)
+        self.assertIn("codebase add", res.err)
+
+    def test_w06_dirty_file_only_marks_anchors_in_that_codebase(self):
+        run = self.workspace()
+        for name in ("api", "web"):
+            self.k("anchor", "add", "SYS-auth", name + "/src/auth.py", "--run", run, ok=True)
+        self.k("run", "end", "--id", run, "--summary", "x", ok=True)
+        # api/src/auth.py is edited after the run: only the api anchor is stale.
+        with open(str(self.root / "api" / "src" / "auth.py"), "a", encoding="utf-8") as fh:
+            fh.write("\n# edit\n")
+        states = {a["id"]: a["state"] for a in self.k("show", "SYS-auth", "--json", ok=True).json().get("anchors", [])}
+        self.assertEqual(states.get("ANC-0001"), "stale")
+        self.assertEqual(states.get("ANC-0002"), "ok")
+
+    def test_w07_source_change_guard_covers_each_codebase(self):
+        run = self.workspace()
+        (self.root / "web" / "src" / "new.py").write_text("x = 1\n", encoding="utf-8")  # untracked file
+        res = self.k("run", "end", "--id", run, "--summary", "x", ok=False)
+        self.assertIn("source state changed", res.err)
+        self.assertIn("web:", res.out + res.err)
+        self.assertNotIn("api:", res.err)
+        self.assertIn("source_changed", self.read("runs/%s/summary.md" % run))
+
+    def test_w08_clean_run_ends_cleanly_and_snapshot_lists_codebases(self):
+        run = self.workspace()
+        self.assertIn("Codebases: 2", self.read("runs/%s/summary.md" % run))
+        self.k("run", "end", "--id", run, "--summary", "x", ok=True)
+        self.assertIn("status: ended", self.read("runs/%s/summary.md" % run))
+
+    def test_w09_changing_the_map_during_a_run_is_refused(self):
+        run = self.workspace()
+        res = self.k("codebase", "remove", "web", ok=False)
+        self.assertIn(run, res.err)
+        self.k("codebase", "add", "--no-git", "notes", ok=False)
+        self.k("run", "end", "--id", run, "--summary", "x", ok=True)
+        self.k("codebase", "remove", "web", ok=True)
+
+    def test_w10_removed_or_missing_codebase_is_reported_not_fatal(self):
+        run = self.workspace()
+        self.k("anchor", "add", "SYS-auth", "web/src/auth.py", "--run", run, ok=True)
+        self.k("run", "end", "--id", run, "--summary", "x", ok=True)
+        self.k("codebase", "remove", "web", ok=True)
+        res = self.k("check", "--json", ok=True)
+        self.assertIn("anchor-codebase-unregistered", self.problem_codes(res))
+        self.k("codebase", "add", "web", ok=True)
+        self.assertNotIn("anchor-codebase-unregistered", self.problem_codes(self.k("check", "--json", ok=True)))
+        shutil.rmtree(str(self.root / "web"))
+        res = self.k("check", "--json", ok=True)  # warnings only
+        self.assertIn("codebase-unavailable", self.problem_codes(res))
+        self.assertIn("anchor-missing-file", self.problem_codes(res))
+        status = self.k("status", "--json", ok=True).json()
+        self.assertTrue(any("web" in a and "not a Git work tree" in a for a in status["attention"]))
+
+    def test_w11_evidence_commit_follows_the_cited_codebase(self):
+        run = self.workspace()
+        self.k("anchor", "add", "SYS-auth", "api/src/auth.py", "--run", run, ok=True)
+        self.k("anchor", "add", "SYS-auth", "web/src/auth.py", "--run", run, ok=True)
+        self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "a",
+               "--anchor", "ANC-0001", "--run", run, ok=True)
+        self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "b",
+               "--anchor", "ANC-0001", "ANC-0002", "--run", run, ok=True)
+        self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "c", "--run", run, ok=True)
+        lines = [json.loads(l) for l in self.read("runs/%s/evidence.jsonl" % run).splitlines()]
+        self.assertEqual([l["repository_commit"] for l in lines], [self.head("api"), None, None])
+
+    def test_w12_coverage_and_orient_are_limited_to_registered_codebases(self):
+        self.init()
+        self.k("codebase", "add", "api", ok=True)
+        cov = self.k("coverage", "--json", ok=True).json()
+        self.assertEqual(cov["total"], 1)  # only api/src/auth.py; web and notes are ignored
+        orient = self.k("orient", "--json", ok=True).json()
+        self.assertEqual(orient["files"], 1)
+        self.assertEqual([c["path"] for c in orient["codebases"]], ["api"])
+
+    def test_w13_malformed_registry_is_a_clear_error(self):
+        self.init()
+        self.write("codebases.json", "{not json")
+        res = self.k("status", ok=False)
+        self.assertIn("codebases.json", res.err)
+        self.write("codebases.json", json.dumps({"schema": "wrong", "codebases": []}))
+        self.assertIn("schema", self.k("status", ok=False).err)
+        self.write("codebases.json", json.dumps({"schema": kernel.CODEBASES_SCHEMA,
+                                                  "codebases": [{"path": "../x"}]}))
+        self.k("status", ok=False)
+
+    def test_w14_workspace_root_may_itself_be_a_repo_with_nested_repos(self):
+        git(self.root, "init", "-q")
+        self.init()
+        self.k("codebase", "add", ".", "api", ok=True)
+        ctx = self._ctx()
+        self.assertEqual(ctx.git.repository_for("api/src/auth.py"), "api")
+        self.assertEqual(ctx.git.repository_for("notes/todo.txt"), ".")
+        self.assertEqual(ctx.git.repository_for("apix/file"), ".")
+
+    def test_w15_single_repo_behaviour_is_unchanged(self):
+        # A normal repository with no registry must keep recording repository "." and its own HEAD.
+        other = self.tmp / "single"
+        (other / "src").mkdir(parents=True)
+        shutil.copy(str(FIXTURE), str(other / "src" / "auth.py"))
+        git(other, "init", "-q")
+        git(other, "add", "-A")
+        git(other, "commit", "-qm", "x")
+        out, err = io.StringIO(), io.StringIO()
+        def kk(*a):
+            return kernel.main([str(x) for x in a] + ["--root", str(other)], stdout=out, stderr=err)
+        self.assertEqual(kk("init"), 0)
+        self.assertEqual(kk("run", "start", "--goal", "g"), 0)
+        self.assertEqual(kk("new", "system", "auth", "--title", "A", "--run", "RUN-0001"), 0)
+        self.assertEqual(kk("anchor", "add", "SYS-auth", "src/auth.py", "--run", "RUN-0001"), 0)
+        text = (other / ".study" / "systems" / "auth.md").read_text(encoding="utf-8")
+        self.assertIn('"repository": "."', text)
+        self.assertIn(git(other, "rev-parse", "HEAD").stdout.decode().strip(), text)
+        self.assertNotIn("codebases", (other / ".study" / "runs" / "RUN-0001" / "summary.md").read_text(encoding="utf-8"))
+
+
 class TestKitHygiene(unittest.TestCase):
     def test_30_stdlib_only_and_python39_syntax(self):
         src = (PKG / "kernel.py").read_text(encoding="utf-8")

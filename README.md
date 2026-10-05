@@ -1,6 +1,6 @@
 # Engineering Memory Kit
 
-Portable, evidence-backed codebase exploration for humans and AI agents. The kit installs a self-contained `.study/` workspace into any repository: a standard-library Python kernel that records subsystem maps, execution flows, source-anchored evidence, claims and potential findings as Markdown and JSONL, with a disposable SQLite index for search. Study mode only: it never edits the target source.
+Portable, evidence-backed codebase exploration for humans and AI agents. The kit installs a self-contained `.study/` workspace into any repository: a standard-library Python kernel that records subsystem maps, execution flows, source-anchored evidence, claims and potential findings as Markdown and JSONL, with a disposable SQLite index for search. Study mode only: it never edits the target source. The one tracked file it can touch is `AGENTS.md`, by adding a marked block, and you can opt out.
 
 ## Quick start
 
@@ -48,31 +48,73 @@ PYTHONPATH=./ai-dev-main/src python -m emkit init .
 
 ```bash
 emkit --version
-emkit init [PATH] [--force] [--dry-run]
+emkit init [PATH] [--force] [--dry-run] [--no-agents] [--codebase DIR ...] [--detect]
 emkit doctor [PATH]
 ```
 
-`emkit init` copies the packaged kernel, protocol, schema and templates into `PATH/.study/`, writes `.study/VERSION`, installs `AGENTS.md` at the repository root, creates the artifact directories, then runs the installed kernel's `init` and `check`. It prints every path it creates, replaces, skips or finds unchanged, and exits non-zero if the installation is incomplete.
+`emkit init` copies the packaged kernel, protocol, schema, agent rules and templates into `PATH/.study/`, writes `.study/VERSION`, adds the Study rules to `AGENTS.md` at the root of `PATH` (see below), creates the artifact directories, then runs the installed kernel's `init` and `check`. It prints every path it creates, replaces, skips or finds unchanged, and exits non-zero if the installation is incomplete.
 
 ```text
 PATH/
-├── AGENTS.md
+├── AGENTS.md              # created, or a marked Study block appended; see below
 └── .study/
-    ├── kernel.py  PROTOCOL.md  schema.json  VERSION
+    ├── kernel.py  PROTOCOL.md  schema.json  AGENTS.md  VERSION
     ├── templates/{system,flow,finding,run}.md
     ├── systems/  flows/  findings/  runs/  scratch/
     └── study.db           # disposable index, excluded from Git
 ```
 
-- Nothing is overwritten by default. A managed file that exists and differs is skipped and reported. An existing `AGENTS.md` of your own is kept; merge the Study rules into it by hand.
-- `--force` replaces managed files that differ, including a root `AGENTS.md`. It never touches records, runs, the index, or files it does not manage, and never deletes anything.
+- Nothing is overwritten by default. A managed file that exists and differs is skipped and reported.
+- `--force` replaces managed files that differ. It never touches records, runs, the index, the codebase registry, or files it does not manage, and never deletes anything.
 - `--dry-run` prints what would be created or replaced and writes nothing, not even a missing destination directory.
 - Writes use a temporary file and an atomic rename. Symlinked destinations are refused.
 - Re-running `init` on an existing installation is safe: unchanged files are left alone, the index is rebuilt from your records.
 - There is no upgrade or merge command yet. To move to a newer kit, run a newer `emkit init --force` and review the diff in Git.
 - In a Git repository, `init` adds `.study/` to `.git/info/exclude` (creating the file if it is missing, appending otherwise, never duplicating), so the workspace stays out of `git status` and out of commits. The file is local to your clone and is not shared. To version the records instead, delete that line. The kernel also appends its four narrower patterns for the index and scratch files. Source files are never touched, and `init` fails if the working tree changes.
 
-`emkit doctor` reports Python compatibility, whether the directory and `.study/kernel.py` exist, the installed kit version, missing or differing managed files, readable templates, whether `kernel.py --help` runs, and Git availability and status (Git is optional). It does not judge your uncommitted changes; the no-source-change guarantee is enforced during `init` itself. It exits zero only when the installation is usable. A file that differs from the packaged copy is an error when the recorded kit version matches (corrupted or edited), and a warning when it comes from another version.
+### The root AGENTS.md
+
+The root `AGENTS.md` belongs to the repository, not to the kit. `emkit` only ever manages one block inside it, wrapped in `<!-- emkit:begin -->` and `<!-- emkit:end -->` markers:
+
+| Situation | What `init` does |
+|---|---|
+| No `AGENTS.md` | Creates one containing the block |
+| `AGENTS.md` exists, no block | Appends the block after your text. Nothing above it changes; CRLF files stay CRLF |
+| Block present and current | Leaves it (`unchanged`) |
+| Block present but different | Skips and reports; `--force` rewrites only the text between the markers |
+| Unbalanced markers, or not UTF-8 | Skips and reports; never modified, not even with `--force` |
+| `--no-agents` | Leaves the file alone; the same rules are always installed as `.study/AGENTS.md` |
+
+The block is a short rule summary that points to `.study/PROTOCOL.md`. Whenever a file is kept, `init` says `skip` and what to do about it: managed files and a differing block say to use `--force`; a file it cannot safely edit says to fix it by hand. Agents read the nearest `AGENTS.md` in the directory tree and the closest one wins, so a repository's own file is never displaced by a workspace-level one. Appending changes a tracked file, which shows up in `git diff`; use `--no-agents` when you do not want that, for example in a repository you do not own.
+
+### One folder, several repositories (workspace mode)
+
+Install into the folder that contains your repositories and tell the kit which ones to study:
+
+```bash
+cd ~/work                                   # contains api/, web/, notes/
+uvx --from git+https://github.com/rafik-mikhail/ai-dev@v0.1.0 emkit init . --detect
+python .study/kernel.py codebase list
+```
+
+`--detect` registers every Git work tree found up to three levels down. `--codebase api --codebase web` (relative to `PATH`) registers specific ones. Later, from the kernel:
+
+```bash
+python .study/kernel.py codebase scan           # list candidates (read-only)
+python .study/kernel.py codebase add web         # start studying a repository
+python .study/kernel.py codebase remove web      # stop; nothing is deleted
+python .study/kernel.py codebase list            # HEAD and working-tree state per codebase
+```
+
+The registry is `.study/codebases.json`. With no codebases registered the kit behaves exactly as in a single repository. Once any is registered:
+
+- Anchors must fall inside a registered codebase. Paths stay relative to the study root (`api/src/auth.py`), and each anchor records its codebase in `repository` and that repository's own HEAD in `commit`.
+- Freshness and the source-change guard are checked per codebase. Editing a file in `web/` makes only `web/` anchors stale, and `run end` names the codebase that changed. Folders that are not registered (such as `notes/`) are ignored.
+- `status`, `orient`, `coverage` and `check` report and cover registered codebases only.
+- Removing a codebase unregisters it. Its anchors and records stay, and `check` warns that they belong to an unregistered codebase. A registered folder that disappears is also a warning, not an error.
+- The map cannot change while a run is open, because the guard compares the same set of repositories at start and end.
+
+`emkit doctor` reports Python compatibility, whether the directory and `.study/kernel.py` exist, the installed kit version, missing or differing managed files, readable templates, whether `AGENTS.md` carries the current Study block, the registered codebases, whether `kernel.py --help` runs, and Git availability and status (Git is optional). It does not judge your uncommitted changes; the no-source-change guarantee is enforced during `init` itself. It exits zero only when the installation is usable. A file that differs from the packaged copy is an error when the recorded kit version matches (corrupted or edited), and a warning when it comes from another version.
 
 The installed `.study/kernel.py` is a byte-for-byte copy of the packaged kernel. It needs only Python 3.9+, never imports `emkit`, and keeps working after the `uvx` environment is gone.
 
@@ -101,7 +143,8 @@ python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry point
 | `finding TITLE --severity --run` | Record a potential issue (never a fix) |
 | `claim add DOC "text" --anchor/--evidence` | Append a numbered, grounded claim to a system or flow |
 | `set ID --status/--confidence [--note]` | Change status or confidence; logged in the document's Status log |
-| `anchor add DOC PATH` | Bind a document to source lines with a fingerprint and the Git SHA |
+| `anchor add DOC PATH` | Bind a document to source lines with a fingerprint and the Git SHA of its codebase |
+| `codebase add\|remove\|list\|scan` | Choose which repositories under the study root are studied (workspace mode) |
 | `evidence add SUBJECT --type --result` | Append an evidence record to the run |
 | `show`, `list`, `search`, `graph` | Read records, links, backlinks and evidence |
 | `coverage` | Anchored vs unanchored files (descriptive only) |
@@ -110,6 +153,19 @@ python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry point
 | `status` | Counts, open runs, anchor states, items needing attention |
 
 Global options: `--root`, `--study-dir`, `--agent` (or `STUDY_AGENT`), `--json`, `--max-event-bytes`. `STUDY_DISABLE_FTS=1` forces the non-FTS search path. Errors print `error: ...` to stderr and exit 1. The operating rules are in `.study/PROTOCOL.md`; a walkthrough is in `examples/minimal/README.md`.
+
+## Methodology
+
+The kit supports one discipline, Study mode: understand a codebase and record what you learned without changing it. The loop is:
+
+1. Orient: survey the layout (`orient`), then search existing records before reading broadly.
+2. Open a run (`run start --goal ...`). The kernel snapshots source state so it can prove nothing changed.
+3. Map systems and flows (`new system|flow`), and bind every technical statement to source with an anchor and evidence.
+4. Record claims with an explicit confidence (hypothesis, inferred, observed). Keep observed behavior, inference and uninspected scope separate.
+5. Log suspicious behavior as findings. Never apply a fix.
+6. End the run with a handoff summary and next steps, so the next session or agent resumes where this one stopped.
+
+The full rules, vocabulary and record formats are in [PROTOCOL.md](src/emkit/resources/PROTOCOL.md), which `emkit init` installs as `.study/PROTOCOL.md`.
 
 ## How it stays honest
 
@@ -123,7 +179,8 @@ Global options: `--root`, `--study-dir`, `--agent` (or `STUDY_AGENT`), `--json`,
 
 - `uvx` provides package isolation, not a read-only sandbox for agents. It keeps `emkit` and its environment away from your project; it does nothing to stop an agent with shell access from editing source. The kernel's guardrails constrain `kernel.py` only, and `AGENTS.md` is a request, not enforcement. For real isolation, mount the source read-only, keep `.study/` writable elsewhere, disable the network, and omit credentials (see Future hardening in `.study/PROTOCOL.md`).
 - Symbol lookup is a text heuristic, not a parser. Without a line range, a symbol anchor covers only its first matching line.
-- Without Git there is no source-change guard, and freshness relies on fingerprints alone.
+- Without Git there is no source-change guard, and freshness relies on fingerprints alone. In workspace mode a codebase registered with `--no-git` has the same limit.
+- Workspace mode checks each registered repository, not Git submodules or worktrees inside it, and an evidence record that cites anchors from several codebases stores a null commit.
 - `orient` is filename and layout heuristics; the entry points it lists are candidates.
 - Concurrent writers are not coordinated beyond exclusive file creation; use one active run per writer.
 - No Change or Verify modes.

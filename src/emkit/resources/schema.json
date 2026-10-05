@@ -45,7 +45,7 @@
       "required": ["id", "repository", "commit", "path", "symbol", "start_line", "end_line", "fingerprint", "created_at"],
       "properties": {
         "id": { "$ref": "#/$defs/anchorId" },
-        "repository": { "type": "string" },
+        "repository": { "type": "string", "description": "Codebase the path belongs to: '.' for the study root itself, otherwise the registered codebase directory relative to the study root (workspace mode)." },
         "commit": { "oneOf": [{ "$ref": "#/$defs/gitSha" }, { "type": "null" }] },
         "path": { "type": "string", "minLength": 1, "description": "Repository-relative POSIX path; no '..', no absolute paths." },
         "symbol": { "type": ["string", "null"] },

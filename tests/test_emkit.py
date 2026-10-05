@@ -29,7 +29,7 @@ HAVE_UVX = shutil.which("uvx") is not None
 EXPECTED_FILES = {
     ".study/kernel.py", ".study/PROTOCOL.md", ".study/schema.json", ".study/VERSION",
     ".study/templates/system.md", ".study/templates/flow.md", ".study/templates/finding.md",
-    ".study/templates/run.md", "AGENTS.md",
+    ".study/templates/run.md", ".study/AGENTS.md", "AGENTS.md",
 }
 EXPECTED_DIRS = {".study", ".study/templates", ".study/systems", ".study/flows", ".study/findings",
                  ".study/runs", ".study/scratch"}
@@ -212,16 +212,18 @@ class TestMetadata(unittest.TestCase):
         headings = [l for l in text.splitlines() if l.startswith("## ")]
         self.assertEqual(headings[0], "## Quick start")
         first = text[text.index("## Quick start"):text.index(headings[1])]
-        self.assertIn("uvx --from git+https://github.com/rafik-mikhail/ai-dev@v0.1.0 emkit init .", first)
+        self.assertIn("uvx --from git+https://github.com/rafik-mikhail/ai-dev@v%s emkit init ." % __version__, first)
         self.assertIn("python .study/kernel.py --help", first)
-        for needle in ("uv tool install", "--force", "--dry-run", "source ZIP", "not a read-only sandbox"):
+        for needle in ("uv tool install", "--force", "--dry-run", "source ZIP", "not a read-only sandbox",
+                       "--no-agents", "--detect", "codebase add", "emkit:begin", "## Methodology"):
             self.assertIn(needle, text)
 
     def test_every_managed_resource_is_packaged(self):
         for m in cli.MANAGED:
             if m.source is not None:
                 self.assertTrue(PKG.joinpath(*m.source).is_file(), m.source)
-        self.assertEqual({m.dest for m in cli.MANAGED}, EXPECTED_FILES)
+        # the root AGENTS.md is deliberately not a managed file: emkit only maintains a marked block in it
+        self.assertEqual({m.dest for m in cli.MANAGED}, EXPECTED_FILES - {"AGENTS.md"})
 
 
 class TestInit(Base):
@@ -242,6 +244,10 @@ class TestInit(Base):
             if m.source:
                 self.assertEqual((self.repo / Path(*m.dest.split("/"))).read_bytes(),
                                  PKG.joinpath(*m.source).read_bytes(), m.dest)
+        root_agents = (self.repo / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertTrue(root_agents.startswith("# AGENTS.md\n\n" + cli.BLOCK_BEGIN + "\n"))
+        self.assertTrue(root_agents.endswith(cli.BLOCK_END + "\n"))
+        self.assertIn(cli.agents_body(), root_agents)
         for line in (".study/kernel.py", ".study/templates/run.md", "AGENTS.md", "kernel init: ok",
                      "kernel check: ok", "next steps:", "kernel.py --help", "run start --goal"):
             self.assertIn(line, proc.stdout)
@@ -272,13 +278,11 @@ class TestInit(Base):
         self.assertEqual(again.stdout.count("unchanged"), len(EXPECTED_FILES))
         self.assertNotIn("replace", again.stdout)
         (self.repo / ".study" / "PROTOCOL.md").write_text("local edit\n", encoding="utf-8")
-        (self.repo / "AGENTS.md").write_text("my own agent rules\n", encoding="utf-8")
         (self.repo / ".study" / "templates" / "flow.md").write_text("tampered\n", encoding="utf-8")
         third = self.emkit("init", self.repo, check=True)
         self.assertEqual((self.repo / ".study" / "PROTOCOL.md").read_text(encoding="utf-8"), "local edit\n")
-        self.assertEqual((self.repo / "AGENTS.md").read_text(encoding="utf-8"), "my own agent rules\n")
         self.assertEqual((self.repo / ".study" / "templates" / "flow.md").read_text(encoding="utf-8"), "tampered\n")
-        for dest in (".study/PROTOCOL.md", "AGENTS.md", ".study/templates/flow.md"):
+        for dest in (".study/PROTOCOL.md", ".study/templates/flow.md"):
             self.assertRegex(third.stdout, r"skip\s+%s " % dest.replace(".", r"\."))
         self.assertIn("use --force", third.stdout)
 
@@ -290,17 +294,25 @@ class TestInit(Base):
         (self.repo / ".study" / "notes.txt").write_text("keep me\n", encoding="utf-8")
         (self.repo / ".study" / "templates" / "custom.md").write_text("mine\n", encoding="utf-8")
         (self.repo / "unrelated.txt").write_text("source\n", encoding="utf-8")
-        for rel in (".study/kernel.py", ".study/PROTOCOL.md", ".study/templates/system.md", "AGENTS.md",
+        for rel in (".study/kernel.py", ".study/PROTOCOL.md", ".study/templates/system.md", ".study/AGENTS.md",
                     ".study/VERSION"):
             (self.repo / Path(*rel.split("/"))).write_text("broken\n", encoding="utf-8")
+        agents = self.repo / "AGENTS.md"  # tamper inside the block, and keep text around it
+        agents.write_text("before\n" + agents.read_text(encoding="utf-8").replace("Study mode only", "WRONG")
+                          + "\nafter\n", encoding="utf-8")
         keep = {rel: sha(self.repo / rel) for rel in
                 (".study/notes.txt", ".study/templates/custom.md", "unrelated.txt",
                  ".study/systems/app.md", ".study/runs/RUN-0001/summary.md",
                  ".study/runs/RUN-0001/events.jsonl", ".study/runs/RUN-0001/evidence.jsonl")}
         proc = self.emkit("init", self.repo, "--force", check=True)
-        self.assertEqual(proc.stdout.count("replace "), 5, proc.stdout)
+        self.assertEqual(proc.stdout.count("replace "), 6, proc.stdout)
         for m in cli.MANAGED:
             self.assertEqual(cli.file_state(self.repo, m), "same", m.dest)
+        text = agents.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("before\n# AGENTS.md"))
+        self.assertTrue(text.endswith("\nafter\n"))
+        self.assertNotIn("WRONG", text)
+        self.assertEqual(cli.agents_plan(self.repo)[0], "same")
         for rel, digest in keep.items():
             self.assertEqual(sha(self.repo / rel), digest, rel)
         found = self.kernel("search", "quokka")
@@ -474,6 +486,165 @@ class TestInit(Base):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("kernel init failed", proc.stderr)
         self.assertIn("installation incomplete", proc.stderr)
+
+
+class TestAgentsFile(Base):
+    """The root AGENTS.md belongs to the repository: emkit only adds or refreshes one marked block."""
+
+    def agents(self):
+        return self.repo / "AGENTS.md"
+
+    def test_a1_existing_file_gets_the_block_appended_and_nothing_else_changes(self):
+        original = "# Team rules\n\nRun tests before pushing.\n"
+        self.agents().write_text(original, encoding="utf-8")
+        proc = self.init()
+        self.assertIn("append    AGENTS.md", proc.stdout)
+        text = self.agents().read_text(encoding="utf-8")
+        self.assertTrue(text.startswith(original))
+        self.assertEqual(text.count(cli.BLOCK_BEGIN), 1)
+        self.assertIn(cli.agents_body(), text)
+        self.assertNotIn("# AGENTS.md", text)  # no second title injected into an existing file
+        snap = self.agents().read_bytes()
+        again = self.init()
+        self.assertIn("unchanged AGENTS.md", again.stdout)
+        self.assertEqual(self.agents().read_bytes(), snap)
+
+    def test_a2_missing_trailing_newline_and_empty_file(self):
+        self.agents().write_text("no newline at end", encoding="utf-8")
+        self.init()
+        text = self.agents().read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("no newline at end\n\n" + cli.BLOCK_BEGIN))
+        self.agents().write_text("", encoding="utf-8")
+        self.init(self.repo, "--force")
+        self.assertTrue(self.agents().read_text(encoding="utf-8").startswith(cli.BLOCK_BEGIN))
+
+    def test_a3_crlf_files_stay_crlf(self):
+        self.agents().write_bytes(b"# Rules\r\nBe kind.\r\n")
+        self.init()
+        raw = self.agents().read_bytes()
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        self.assertIn(cli.BLOCK_BEGIN.encode() + b"\r\n", raw)
+        self.assertIn("unchanged AGENTS.md", self.init().stdout)
+
+    def test_a4_tampered_block_needs_force_and_only_the_block_is_replaced(self):
+        self.agents().write_text("top\n", encoding="utf-8")
+        self.init()
+        text = self.agents().read_text(encoding="utf-8")
+        edited = "intro\n" + text.replace("Study mode only", "CHANGED") + "outro\n"
+        self.agents().write_text(edited, encoding="utf-8")
+        skipped = self.init()
+        self.assertIn("skip      AGENTS.md (Study block differs", skipped.stdout)
+        self.assertEqual(self.agents().read_text(encoding="utf-8"), edited)
+        forced = self.init(self.repo, "--force")
+        self.assertIn("replace   AGENTS.md (Study block only)", forced.stdout)
+        fixed = self.agents().read_text(encoding="utf-8")
+        self.assertTrue(fixed.startswith("intro\ntop\n"))
+        self.assertTrue(fixed.endswith("outro\n"))
+        self.assertNotIn("CHANGED", fixed)
+
+    def test_a5_no_agents_leaves_the_root_file_alone(self):
+        self.init(self.repo, "--no-agents")
+        self.assertFalse(self.agents().exists())
+        self.assertTrue((self.repo / ".study" / "AGENTS.md").is_file())
+        self.agents().write_text("mine\n", encoding="utf-8")
+        proc = self.init(self.repo, "--no-agents", "--force")
+        self.assertIn("--no-agents", proc.stdout)
+        self.assertEqual(self.agents().read_text(encoding="utf-8"), "mine\n")
+
+    def test_a6_unbalanced_markers_and_binary_files_are_never_touched(self):
+        for payload in (("x\n" + cli.BLOCK_BEGIN + "\nhalf\n").encode(),
+                        (cli.BLOCK_END + "\n" + cli.BLOCK_BEGIN + "\n").encode(),
+                        b"\xff\xfe\x00binary"):
+            self.agents().write_bytes(payload)
+            for flags in ((), ("--force",)):
+                proc = self.init(self.repo, *flags)
+                self.assertRegex(proc.stdout, r"skip\s+AGENTS.md")
+                self.assertEqual(self.agents().read_bytes(), payload)
+
+    def test_a7_dry_run_reports_without_writing(self):
+        self.agents().write_text("mine\n", encoding="utf-8")
+        proc = self.emkit("init", self.repo, "--dry-run", check=True)
+        self.assertIn("would append    AGENTS.md", proc.stdout)
+        self.assertEqual(self.agents().read_text(encoding="utf-8"), "mine\n")
+
+    def test_a8_doctor_warns_when_agents_cannot_see_the_rules(self):
+        self.init()
+        self.agents().write_text("replaced by the owner\n", encoding="utf-8")
+        res = self.emkit("doctor", self.repo)
+        self.assertEqual(res.returncode, 0, res.stdout)
+        self.assertIn("AGENTS.md has no Study block", res.stdout)
+        self.agents().unlink()
+        self.assertIn("no AGENTS.md", self.emkit("doctor", self.repo).stdout)
+
+
+class TestWorkspaceInstall(Base):
+    """`emkit init` in a folder that holds several repositories."""
+
+    def setUp(self):
+        super().setUp()
+        if not HAVE_GIT:
+            self.skipTest("git not available")
+        for name in ("api", "web"):
+            (self.repo / name / "src").mkdir(parents=True)
+            (self.repo / name / "src" / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+            git(self.repo / name, "init", "-q")
+            git(self.repo / name, "add", "-A")
+            git(self.repo / name, "commit", "-qm", "init")
+        (self.repo / "notes").mkdir()
+
+    def registered(self):
+        path = self.repo / ".study" / "codebases.json"
+        return [e["path"] for e in json.loads(path.read_text(encoding="utf-8"))["codebases"]] if path.exists() else []
+
+    def test_w1_detect_registers_every_repository(self):
+        proc = self.init(self.repo, "--detect")
+        self.assertIn("registered api", proc.stdout)
+        self.assertEqual(self.registered(), ["api", "web"])
+        self.assertTrue((self.repo / "AGENTS.md").is_file())  # created at the workspace root, which has none
+        doc = self.emkit("doctor", self.repo)
+        self.assertEqual(doc.returncode, 0, doc.stdout)
+        self.assertIn("workspace mode: 2 registered codebase(s): api, web", doc.stdout)
+        self.assertNotIn("not a Git repository", doc.stdout)
+
+    def test_w2_codebase_flag_is_relative_to_the_workspace_and_repeatable(self):
+        proc = self.emkit("init", self.repo, "--codebase", "api", "--codebase", self.repo / "web", cwd=self.tmp)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(self.registered(), ["api", "web"])
+        again = self.emkit("init", self.repo, "--codebase", "api", check=True)
+        self.assertIn("already registered api", again.stdout)
+
+    def test_w3_bad_codebase_fails_the_install_loudly(self):
+        proc = self.emkit("init", self.repo, "--codebase", "notes")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("codebase registration failed", proc.stderr)
+        proc = self.emkit("init", self.repo, "--codebase", "nope")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not found", proc.stderr)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        proc = self.emkit("init", self.repo, "--codebase", outside)
+        self.assertEqual(proc.returncode, 1)
+
+    def test_w4_dry_run_registers_nothing_and_force_keeps_the_registry(self):
+        proc = self.emkit("init", self.repo, "--detect", "--dry-run", check=True)
+        self.assertIn("would register", proc.stdout)
+        self.assertFalse((self.repo / ".study").exists())
+        self.init(self.repo, "--detect")
+        self.init(self.repo, "--force")
+        self.assertEqual(self.registered(), ["api", "web"])
+
+    def test_w5_study_session_end_to_end_across_two_repositories(self):
+        self.init(self.repo, "--detect")
+        k = lambda *a: self.kernel(*a)
+        self.assertEqual(k("run", "start", "--goal", "g").stdout.strip(), "RUN-0001")
+        self.assertEqual(k("new", "system", "app", "--title", "App", "--run", "RUN-0001").returncode, 0)
+        for repo in ("api", "web"):
+            res = k("anchor", "add", "SYS-app", repo + "/src/app.py", "--symbol", "main", "--run", "RUN-0001")
+            self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(k("run", "end", "--id", "RUN-0001", "--summary", "done").returncode, 0)
+        # the studied repositories were not modified: still clean
+        for repo in ("api", "web"):
+            self.assertEqual(git(self.repo / repo, "status", "--porcelain").stdout, b"")
 
 
 class TestDoctor(Base):

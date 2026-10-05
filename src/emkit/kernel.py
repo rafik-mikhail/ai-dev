@@ -38,7 +38,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-VERSION = "0.2.0"
+VERSION = "0.1.0"
 
 # =============================================================================
 # 1. Constants and errors
@@ -71,6 +71,10 @@ EVENT_SCHEMA = "engineering-study-event/v1"
 DEFAULT_EVENT_MAX_BYTES = 16 * 1024
 TEMPLATE_NAMES = ("system.md", "flow.md", "finding.md", "run.md")
 KIT_FILES = ("kernel.py", "PROTOCOL.md", "schema.json")
+
+CODEBASES_FILE = "codebases.json"
+CODEBASES_SCHEMA = "engineering-study-codebases/v1"
+SCAN_MAX_DEPTH = 3
 
 COVERAGE_EXCLUDED_DIRS = (
     ".git", ".study", "node_modules", "__pycache__", "venv", ".venv", "dist", "build", "target",
@@ -391,7 +395,9 @@ class GitInspector:
     """Runs only `git rev-parse` and `git status`, with optional locks disabled
     so the Git index is never refreshed or rewritten."""
 
-    def __init__(self, root: Path, study_rel: str, git_exe: str = "git") -> None:
+    multi = False
+
+    def __init__(self, root: Path, study_rel: Optional[str], git_exe: str = "git") -> None:
         self.root = root
         self.study_rel = study_rel
         self.git_exe = git_exe
@@ -438,10 +444,9 @@ class GitInspector:
         return ""
 
     def _status_entries(self) -> List[str]:
-        args = [
-            "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".",
-            ":(exclude)%s" % self.study_rel,
-        ]
+        args = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."]
+        if self.study_rel:
+            args.append(":(exclude)%s" % self.study_rel)
         result = self._run(args)
         if result is None or result[0] != 0:
             raise KitError("git status failed; cannot inspect working-tree state")
@@ -493,9 +498,108 @@ class GitInspector:
             path = self.root / path
         return path
 
+    # Codebase-aware interface shared with MultiGit. A single repository is the codebase ".".
+    def repository_for(self, rel: str) -> Optional[str]:
+        return "."
+
+    def head_for(self, repo: str) -> Optional[str]:
+        return self.head()
+
+    def available_for(self, repo: str) -> bool:
+        return self.available()
+
+    def codebase_rows(self) -> List[Dict[str, Any]]:
+        return []
+
+
+class MultiGit:
+    """Workspace mode: the study root holds several codebases (usually Git repositories).
+
+    Each registered codebase is inspected on its own, read-only. Paths stay relative to the
+    study root; every anchor records the codebase it belongs to in its `repository` field."""
+
+    multi = True
+
+    def __init__(self, root: Path, study: Path, paths: Sequence[str], git_exe: str = "git") -> None:
+        self.root = root
+        self.paths = sorted(paths)
+        try:
+            root_study_rel: Optional[str] = study.relative_to(root).as_posix()
+        except ValueError:
+            root_study_rel = None
+        self.root_git = GitInspector(root, root_study_rel, git_exe)
+        self.members: Dict[str, GitInspector] = {}
+        for p in self.paths:
+            base = root if p == "." else root.joinpath(*p.split("/"))
+            study_rel: Optional[str] = None
+            if study == base or is_relative_to(study, base):
+                study_rel = study.relative_to(base).as_posix()
+            self.members[p] = GitInspector(base, study_rel, git_exe)
+
+    def available(self) -> bool:
+        return any(g.available() for g in self.members.values())
+
+    def head(self) -> Optional[str]:
+        return None  # there is no single HEAD; see codebase_rows()
+
+    def repository_for(self, rel: str) -> Optional[str]:
+        best: Optional[str] = None
+        for p in self.paths:
+            if p == "." or rel == p or rel.startswith(p + "/"):
+                if best is None or len(p) > len(best) or best == ".":
+                    best = p
+        return best
+
+    def head_for(self, repo: str) -> Optional[str]:
+        g = self.members.get(repo)
+        return g.head() if g else None
+
+    def available_for(self, repo: str) -> bool:
+        g = self.members.get(repo)
+        return bool(g and g.available())
+
+    def dirty_paths(self) -> Set[str]:
+        out: Set[str] = set()
+        for p, g in self.members.items():
+            if not g.available():
+                continue
+            for d in g.dirty_paths():
+                out.add(d if p == "." else p + "/" + d)
+        return out
+
+    def snapshot(self) -> Dict[str, Any]:
+        subs = {p: g.snapshot() for p, g in self.members.items()}
+        return {"git": any(x["git"] for x in subs.values()), "head": None, "porcelain": [], "codebases": subs}
+
+    def exclude_file(self) -> Optional[Path]:
+        return self.root_git.exclude_file()
+
+    def codebase_rows(self) -> List[Dict[str, Any]]:
+        rows = []
+        for p, g in self.members.items():
+            ok = g.available()
+            rows.append({"path": p, "git": ok, "head": g.head() if ok else None,
+                         "changed_entries": len(g.status_tokens()) if ok else None})
+        return rows
+
 
 def diff_snapshots(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, Any]:
     """Describe the difference between two source-state snapshots (no file contents)."""
+    if "codebases" in before or "codebases" in after:
+        empty = {"git": False, "head": None, "porcelain": []}
+        bs, as_ = before.get("codebases", {}), after.get("codebases", {})
+        changed, reasons = False, []
+        added: List[str] = []
+        removed: List[str] = []
+        for name in sorted(set(bs) | set(as_)):
+            sub = diff_snapshots(bs.get(name, empty), as_.get(name, empty))
+            if sub["changed"]:
+                changed = True
+                reasons.append("%s: %s" % (name, sub["reason"] or "state differs"))
+                added.extend("%s: %s" % (name, x) for x in sub["added"])
+                removed.extend("%s: %s" % (name, x) for x in sub["removed"])
+        return {"changed": changed, "reason": "; ".join(reasons), "head_before": None, "head_after": None,
+                "added": added, "removed": removed}
     if bool(before.get("git")) != bool(after.get("git")):
         return {"changed": True, "reason": "git availability changed", "head_before": before.get("head"),
                 "head_after": after.get("head"), "added": [], "removed": []}
@@ -1325,6 +1429,18 @@ def analyze(ctx: "Context", rec: Records, evaluate: bool = True) -> List[Problem
             elif a["state"] != "ok":
                 out.append(Problem("warning", "anchor-" + a["state"].replace("_", "-"),
                                    "anchor %s is %s (%s)" % (a["id"], a["state"], a["path"]), where))
+        registered = set(ctx.codebases) if ctx.codebases else {"."}
+        for a in rec.anchors:
+            if a["repository"] not in registered:
+                out.append(Problem("warning", "anchor-codebase-unregistered",
+                                   "anchor %s belongs to codebase %s, which is not registered (%s codebase add %s)"
+                                   % (a["id"], a["repository"], ctx.kernel_cmd(), a["repository"]),
+                                   doc_path_by_id.get(a["doc_id"])))
+        for cb in ctx.codebases:
+            if not ctx.git.available_for(cb):
+                out.append(Problem("warning", "codebase-unavailable",
+                                   "registered codebase %s is missing or not a Git work tree; its freshness "
+                                   "and source-change guard are unavailable" % cb))
         if rec.anchors and not ctx.git.available():
             out.append(Problem("warning", "freshness-limited",
                                "Git is unavailable; anchor freshness is limited to fingerprint comparison"))
@@ -1656,9 +1772,10 @@ class Context:
     max_event_bytes: int
     disable_fts: bool
     fs: StudyFS
-    git: GitInspector
+    git: Any  # GitInspector, or MultiGit when codebases are registered
     out: Any
     err: Any
+    codebases: List[str] = dataclasses.field(default_factory=list)
 
     def say(self, text: str = "") -> None:
         print(text, file=self.out)
@@ -1684,6 +1801,35 @@ def default_root() -> Path:
     return here.parent if here.name == ".study" else Path.cwd()
 
 
+def load_codebases(fs: StudyFS) -> List[str]:
+    """Registered codebase paths (root-relative POSIX, '.' for the root itself); [] if none."""
+    path = fs.study / CODEBASES_FILE
+    if not path.is_file():
+        return []
+    try:
+        obj = json.loads(fs.read_bytes(path).decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        raise KitError("cannot read %s: %s" % (CODEBASES_FILE, exc))
+    if not isinstance(obj, dict) or obj.get("schema") != CODEBASES_SCHEMA:
+        raise KitError("%s: unexpected or missing schema (expected %s)" % (CODEBASES_FILE, CODEBASES_SCHEMA))
+    items = obj.get("codebases")
+    if not isinstance(items, list):
+        raise KitError("%s: 'codebases' must be a list" % CODEBASES_FILE)
+    out: List[str] = []
+    for item in items:
+        raw = item.get("path") if isinstance(item, dict) else None
+        if not isinstance(raw, str):
+            raise KitError("%s: every entry needs a string 'path'" % CODEBASES_FILE)
+        rel = "." if raw == "." else normalize_repo_relpath(raw, "codebase path")
+        if rel != "." and rel.split("/")[0] in (".git", ".study"):
+            raise KitError("%s: invalid codebase path %r" % (CODEBASES_FILE, raw))
+        resolve_inside(fs.root, rel)
+        if rel in out:
+            raise KitError("%s: duplicate codebase %r" % (CODEBASES_FILE, rel))
+        out.append(rel)
+    return sorted(out)
+
+
 def build_context(args: argparse.Namespace, out: Any, err: Any, require_study: bool) -> Context:
     raw_root = getattr(args, "root", None)
     root = Path(os.path.realpath(raw_root)) if raw_root else Path(os.path.realpath(str(default_root())))
@@ -1706,10 +1852,12 @@ def build_context(args: argparse.Namespace, out: Any, err: Any, require_study: b
     if require_study and not fs.study.is_dir():
         raise KitError("study directory not found: %s (run: python kernel.py init --root %s)" % (fs.study, root))
     study_rel = fs.study.relative_to(fs.root).as_posix()
+    codebases = load_codebases(fs) if fs.study.is_dir() else []
+    git: Any = MultiGit(fs.root, fs.study, codebases) if codebases else GitInspector(fs.root, study_rel)
     return Context(
         root=fs.root, study=fs.study, agent=agent, json_mode=bool(getattr(args, "json_out", False)),
         max_event_bytes=raw_max, disable_fts=os.environ.get("STUDY_DISABLE_FTS") == "1",
-        fs=fs, git=GitInspector(fs.root, study_rel), out=out, err=err,
+        fs=fs, git=git, out=out, err=err, codebases=codebases,
     )
 
 
@@ -1804,6 +1952,21 @@ def validate_anchor_refs(ctx: Context, refs: Optional[Sequence[str]]) -> List[st
 
 
 def format_state_lines(state: Dict[str, Any], limit: int = 20) -> str:
+    if "codebases" in state:
+        subs = state["codebases"]
+        lines = ["- Codebases: %d" % len(subs)]
+        for name in sorted(subs):
+            sub = subs[name]
+            if not sub.get("git"):
+                lines.append("  - `%s`: not a Git work tree (source-change guard unavailable)" % name)
+                continue
+            entries = sub.get("porcelain", [])
+            lines.append("  - `%s`: HEAD %s, working-tree entries: %d" % (name, sub.get("head") or "none", len(entries)))
+            for entry in entries[:limit]:
+                lines.append("    - `%s`" % entry.replace("`", "'"))
+            if len(entries) > limit:
+                lines.append("    - ... and %d more" % (len(entries) - limit))
+        return "\n".join(lines)
     lines = ["- Git repository: %s" % ("yes" if state.get("git") else "no (source-change guard unavailable)"),
              "- HEAD: %s" % (state.get("head") or "none"),
              "- Working-tree entries (porcelain, study directory excluded): %d" % len(state.get("porcelain", []))]
@@ -1947,7 +2110,12 @@ def cmd_run_start(ctx: Context, args: argparse.Namespace) -> int:
     append_event(ctx, run_id, "run_start", [run_id], {
         "goal": goal, "git": snapshot["git"], "head": snapshot["head"],
         "porcelain_entries": len(snapshot["porcelain"])})
-    if not snapshot["git"]:
+    if "codebases" in snapshot:
+        for name, sub in sorted(snapshot["codebases"].items()):
+            if not sub["git"]:
+                ctx.warn("codebase %s is not a Git work tree; the source-change guard is unavailable for it in %s"
+                         % (name, run_id))
+    elif not snapshot["git"]:
         ctx.warn("not a Git repository; the source-change guard is unavailable for %s" % run_id)
     refresh_index(ctx)
     if ctx.json_mode:
@@ -2061,7 +2229,7 @@ def cmd_run_end(ctx: Context, args: argparse.Namespace) -> int:
         ctx.emit_json({"id": run_id, "status": status, "problems": [p.to_dict() for p in shown]})
         return 0
     ctx.say("ended %s" % run_id)
-    if not ctx.git.available():
+    if not ctx.git.available() and not ctx.codebases:
         ctx.say("note: not a Git repository; source-change guard was unavailable")
     if shown:
         ctx.say("unresolved problems (%d):" % len(shown))
@@ -2186,9 +2354,17 @@ def cmd_anchor_add(ctx: Context, args: argparse.Namespace) -> int:
             if not any(start <= h <= end for h in hits):
                 warnings.append("symbol %r has no textual match within lines %d-%d" % (symbol, start, end))
     fingerprint = fingerprint_lines(lines, start, end)
-    commit = ctx.git.head()
-    if not ctx.git.available():
-        warnings.append("not a Git repository; anchor freshness is limited (commit recorded as null)")
+    repo = ctx.git.repository_for(rel)
+    if repo is None:
+        raise KitError("%s is not inside a registered codebase; register it first: %s codebase add <path>"
+                       % (rel, ctx.kernel_cmd()))
+    commit = ctx.git.head_for(repo)
+    if not ctx.git.available_for(repo):
+        if repo == ".":
+            warnings.append("not a Git repository; anchor freshness is limited (commit recorded as null)")
+        else:
+            warnings.append("codebase %s is not a Git work tree; anchor freshness is limited "
+                            "(commit recorded as null)" % repo)
     elif commit is None:
         warnings.append("repository has no commits; anchor commit recorded as null")
     existing, aprobs = parse_anchor_block(body)
@@ -2206,7 +2382,7 @@ def cmd_anchor_add(ctx: Context, args: argparse.Namespace) -> int:
     number = max(max_number_in_files(ctx, all_doc_files(ctx), "ANC") + 1, 1)
     anchor_id = "ANC-%04d" % number
     record = {
-        "id": anchor_id, "repository": ".", "commit": commit, "path": rel, "symbol": symbol,
+        "id": anchor_id, "repository": repo, "commit": commit, "path": rel, "symbol": symbol,
         "start_line": start, "end_line": end, "fingerprint": fingerprint, "created_at": utc_now(),
     }
     fm["anchors"] = list(fm.get("anchors", [])) + [anchor_id]
@@ -2220,6 +2396,23 @@ def cmd_anchor_add(ctx: Context, args: argparse.Namespace) -> int:
     refresh_index(ctx)
     ctx.say("%s %s:%d-%d" % (anchor_id, rel, start, end))
     return 0
+
+
+def evidence_commit(ctx: Context, anchor_ids: Sequence[str]) -> Optional[str]:
+    """Commit recorded on an evidence record. In workspace mode it is the current HEAD of the single
+    codebase the cited anchors belong to; null when there are no anchors or they span codebases."""
+    if not ctx.codebases:
+        return ctx.git.head()
+    if not anchor_ids:
+        return None
+    by_id = {a["id"]: a for a in load_records(ctx, evaluate=False).anchors}
+    repos = {by_id[i]["repository"] for i in anchor_ids if i in by_id}
+    if len(repos) != 1:
+        if len(repos) > 1:
+            ctx.warn("cited anchors span several codebases (%s); evidence commit recorded as null"
+                     % ", ".join(sorted(repos)))
+        return None
+    return ctx.git.head_for(next(iter(repos)))
 
 
 def cmd_evidence_add(ctx: Context, args: argparse.Namespace) -> int:
@@ -2240,7 +2433,7 @@ def cmd_evidence_add(ctx: Context, args: argparse.Namespace) -> int:
     ev_id = "EV-%04d" % number
     record = {
         "schema": EVIDENCE_SCHEMA, "id": ev_id, "subject": subject, "type": args.type,
-        "repository_commit": ctx.git.head(), "anchors": anchors, "producer": ctx.agent,
+        "repository_commit": evidence_commit(ctx, anchors), "anchors": anchors, "producer": ctx.agent,
         "timestamp": utc_now(), "result": result, "limitations": limitations,
         "command": args.cmd_text, "exit_code": args.exit_code,
     }
@@ -2451,25 +2644,28 @@ def cmd_graph(ctx: Context, args: argparse.Namespace) -> int:
 
 
 def walk_target(ctx: Context) -> Tuple[List[str], int]:
-    files: List[str] = []
+    files: Set[str] = set()
     skipped = 0
-    for dirpath, dirnames, filenames in os.walk(str(ctx.root), followlinks=False):
-        kept = []
-        for d in sorted(dirnames):
-            full = os.path.join(dirpath, d)
-            if d in COVERAGE_EXCLUDED_DIRS or Path(os.path.realpath(full)) == ctx.study:
-                continue
-            if os.path.islink(full):
-                skipped += 1
-                continue
-            kept.append(d)
-        dirnames[:] = kept
-        for name in sorted(filenames):
-            full = os.path.join(dirpath, name)
-            if os.path.islink(full):
-                skipped += 1
-                continue
-            files.append(Path(full).relative_to(ctx.root).as_posix())
+    starts = ctx.codebases if ctx.codebases else ["."]
+    for start in starts:
+        base = ctx.root if start == "." else ctx.root.joinpath(*start.split("/"))
+        for dirpath, dirnames, filenames in os.walk(str(base), followlinks=False):
+            kept = []
+            for d in sorted(dirnames):
+                full = os.path.join(dirpath, d)
+                if d in COVERAGE_EXCLUDED_DIRS or Path(os.path.realpath(full)) == ctx.study:
+                    continue
+                if os.path.islink(full):
+                    skipped += 1
+                    continue
+                kept.append(d)
+            dirnames[:] = kept
+            for name in sorted(filenames):
+                full = os.path.join(dirpath, name)
+                if os.path.islink(full):
+                    skipped += 1
+                    continue
+                files.add(Path(full).relative_to(ctx.root).as_posix())
     return sorted(files), skipped
 
 
@@ -2544,6 +2740,196 @@ def cmd_check(ctx: Context, args: argparse.Namespace) -> int:
     return 0
 
 
+def scan_codebases(ctx: Context, max_depth: int = SCAN_MAX_DEPTH) -> List[str]:
+    """Root-relative paths of Git work trees found below the root (read-only; does not descend into one)."""
+    found: List[str] = []
+
+    def has_git(directory: Path) -> bool:
+        return (directory / ".git").exists()
+
+    def walk(directory: Path, rel: str, depth: int) -> None:
+        if rel != "." and has_git(directory):
+            found.append(rel)
+            return
+        if depth >= max_depth:
+            return
+        try:
+            names = sorted(os.listdir(str(directory)))
+        except OSError:
+            return
+        for name in names:
+            full = directory / name
+            if name in COVERAGE_EXCLUDED_DIRS or name.startswith("."):
+                continue
+            if os.path.islink(str(full)) or not full.is_dir() or Path(os.path.realpath(str(full))) == ctx.study:
+                continue
+            walk(full, name if rel == "." else rel + "/" + name, depth + 1)
+
+    if has_git(ctx.root):
+        found.append(".")
+    walk(ctx.root, ".", 0)
+    return sorted(found)
+
+
+def codebase_arg(ctx: Context, raw: str) -> str:
+    """Normalize a user-supplied codebase path to a root-relative POSIX path ('.' for the root)."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise KitError("codebase path must not be empty")
+    if os.path.isabs(raw) or re.match(r"^[A-Za-z]:[\\/]", raw):
+        real = Path(os.path.realpath(raw))
+        if real == ctx.root:
+            rel = "."
+        elif is_relative_to(real, ctx.root):
+            rel = real.relative_to(ctx.root).as_posix()
+        else:
+            raise KitError("codebase must be inside the study root %s: %s" % (ctx.root, raw))
+    elif raw.replace("\\", "/").strip("/") in ("", "."):
+        rel = "."
+    else:
+        rel = normalize_repo_relpath(raw.replace("\\", "/"), "codebase path")
+    if rel != "." and rel.split("/")[0] in (".git", ".study"):
+        raise KitError("not a valid codebase path: %s" % raw)
+    real = resolve_inside(ctx.root, rel)
+    if not real.is_dir():
+        raise KitError("codebase directory not found: %s" % rel)
+    if real == ctx.study or is_relative_to(real, ctx.study):
+        raise KitError("the study directory cannot be a codebase")
+    return rel
+
+
+def write_codebases(ctx: Context, paths: Sequence[str], added: Dict[str, str]) -> None:
+    entries = [{"path": p, "added": added.get(p) or utc_now()} for p in sorted(paths)]
+    obj = {"schema": CODEBASES_SCHEMA, "codebases": entries}
+    ctx.fs.atomic_write(ctx.study / CODEBASES_FILE, (json.dumps(obj, indent=2, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def registry_added(ctx: Context) -> Dict[str, str]:
+    path = ctx.study / CODEBASES_FILE
+    if not path.is_file():
+        return {}
+    try:
+        obj = json.loads(ctx.fs.read_bytes(path).decode("utf-8"))
+        return {e["path"]: e.get("added", "") for e in obj.get("codebases", [])}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def require_no_open_run(ctx: Context) -> None:
+    open_runs = [r["id"] for r in load_records(ctx, evaluate=False).runs if r["status"] == "open"]
+    if open_runs:
+        raise KitError("end the open run(s) first (%s): changing the codebase map during a run would "
+                       "make the source-change guard compare different sets of repositories" % ", ".join(open_runs))
+
+
+def cmd_codebase(ctx: Context, args: argparse.Namespace) -> int:
+    action = args.codebase_cmd
+    if action == "scan":
+        found = scan_codebases(ctx)
+        rows = [{"path": p, "registered": p in ctx.codebases} for p in found]
+        if ctx.json_mode:
+            ctx.emit_json({"root": str(ctx.root), "candidates": rows})
+            return 0
+        if not rows:
+            ctx.say("no Git work trees found within %d levels of %s" % (SCAN_MAX_DEPTH, ctx.root))
+            return 0
+        for row in rows:
+            ctx.say("%-30s %s" % (row["path"], "registered" if row["registered"] else "not registered"))
+        todo = [r["path"] for r in rows if not r["registered"]]
+        if todo:
+            ctx.say("register with: %s codebase add %s    (or: codebase add --detected)"
+                    % (ctx.kernel_cmd(), " ".join(todo)))
+        return 0
+
+    if action == "list":
+        rows = ctx.git.codebase_rows()
+        anchors = load_records(ctx, evaluate=False).anchors
+        for row in rows:
+            row["anchors"] = len([a for a in anchors if a["repository"] == row["path"]])
+        if ctx.json_mode:
+            ctx.emit_json({"mode": "workspace" if ctx.codebases else "single", "root": str(ctx.root),
+                           "codebases": rows})
+            return 0
+        if not rows:
+            ctx.say("single-repository mode: the study root is the only codebase (%s)" % ctx.root)
+            ctx.say("add codebases with: %s codebase add <path>   (find them: codebase scan)" % ctx.kernel_cmd())
+            return 0
+        ctx.say("workspace mode, root: %s" % ctx.root)
+        for row in rows:
+            state = ("HEAD %s, %d working-tree entries" % ((row["head"] or "none")[:12], row["changed_entries"])
+                     if row["git"] else "not a Git work tree (guard unavailable)")
+            ctx.say("  %-24s %s; anchors: %d" % (row["path"], state, row["anchors"]))
+        return 0
+
+    require_no_open_run(ctx)
+    current = list(ctx.codebases)
+    added = registry_added(ctx)
+    if action == "add":
+        wanted = [codebase_arg(ctx, raw) for raw in (args.paths or [])]
+        if args.detected:
+            wanted.extend(p for p in scan_codebases(ctx) if p not in wanted)
+        if not wanted:
+            raise KitError("give at least one PATH, or --detected (see: codebase scan)")
+        results = []
+        for rel in wanted:
+            if rel in current:
+                results.append({"path": rel, "result": "already registered"})
+                continue
+            base = ctx.root if rel == "." else ctx.root.joinpath(*rel.split("/"))
+            probe = GitInspector(base, None)
+            if not probe.available() and not args.no_git:
+                raise KitError("%s is not a Git work tree (use --no-git to register it without a source-change "
+                               "guard)" % rel)
+            current.append(rel)
+            added[rel] = utc_now()
+            results.append({"path": rel, "result": "registered", "head": probe.head() if probe.available() else None,
+                            "git": probe.available()})
+        write_codebases(ctx, current, added)
+        if ctx.json_mode:
+            ctx.emit_json({"codebases": sorted(current), "results": results})
+            return 0
+        for r in results:
+            note = "" if r["result"] != "registered" else (
+                " (HEAD %s)" % (r["head"] or "none")[:12] if r["git"] else " (no Git: guard unavailable)")
+            ctx.say("%s %s%s" % (r["result"], r["path"], note))
+        return 0
+
+    # remove
+    rel = codebase_arg_loose(ctx, args.path)
+    if rel not in current:
+        raise KitError("not a registered codebase: %s (registered: %s)" % (rel, ", ".join(current) or "none"))
+    current.remove(rel)
+    write_codebases(ctx, current, added)
+    kept = len([a for a in load_records(ctx, evaluate=False).anchors if a["repository"] == rel])
+    if ctx.json_mode:
+        ctx.emit_json({"removed": rel, "codebases": sorted(current), "anchors_kept": kept})
+        return 0
+    ctx.say("removed %s from the codebase map; no files or records were deleted" % rel)
+    if kept:
+        ctx.say("%d anchor(s) for it stay in the records and will be reported as codebase-unregistered" % kept)
+    if not current:
+        ctx.say("no codebases left: back to single-repository mode")
+    return 0
+
+
+def codebase_arg_loose(ctx: Context, raw: str) -> str:
+    """Like codebase_arg, but the directory may no longer exist (it is being removed)."""
+    try:
+        return codebase_arg(ctx, raw)
+    except KitError:
+        rel = "." if raw.strip().strip("/") in ("", ".") else normalize_repo_relpath(raw.replace("\\", "/"), "codebase path")
+        return rel
+
+
+def say_codebases(ctx: Context, rows: Sequence[Dict[str, Any]]) -> None:
+    ctx.say("codebases: %d" % len(rows))
+    for row in rows:
+        if row["git"]:
+            ctx.say("  %-24s HEAD %s, %d working-tree entries"
+                    % (row["path"], (row["head"] or "none")[:12], row["changed_entries"]))
+        else:
+            ctx.say("  %-24s not a Git work tree (guard unavailable)" % row["path"])
+
+
 def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     rec, problems = gather(ctx)
     index = Index(ctx)
@@ -2572,8 +2958,12 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
         attention.append("%d structural error(s); run: check" % n_err)
     if not index.exists():
         attention.append("index database missing; run: rebuild")
-    if not ctx.git.available():
+    if not ctx.git.available() and not ctx.codebases:
         attention.append("not a Git repository; freshness and the source-change guard are limited")
+    rows = ctx.git.codebase_rows()
+    for row in rows:
+        if not row["git"]:
+            attention.append("codebase %s is missing or not a Git work tree; its guard is unavailable" % row["path"])
     head = ctx.git.head()
     payload = {
         "git_available": ctx.git.available(), "git_head": head, "documents": counts,
@@ -2581,10 +2971,15 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
         "search_backend": index.backend(), "database": ctx.display(index.db_path),
         "database_present": index.exists(), "attention": attention,
     }
+    if rows:
+        payload["codebases"] = rows
     if ctx.json_mode:
         ctx.emit_json(payload)
         return 0
-    ctx.say("git head: %s" % (head or ("none" if ctx.git.available() else "none (not a Git repository)")))
+    if rows:
+        say_codebases(ctx, rows)
+    else:
+        ctx.say("git head: %s" % (head or ("none" if ctx.git.available() else "none (not a Git repository)")))
     ctx.say("documents: " + " ".join("%s=%d" % (k, counts[k]) for k in KINDS))
     ctx.say("open findings: " + " ".join("%s=%d" % (s, open_findings[s]) for s in SEVERITIES))
     ctx.say("open runs: %s" % (", ".join(open_runs) if open_runs else "none"))
@@ -2824,6 +3219,7 @@ def cmd_orient(ctx: Context, args: argparse.Namespace) -> int:
         "root": str(ctx.root),
         "git_available": ctx.git.available(),
         "git_head": ctx.git.head(),
+        "codebases": ctx.git.codebase_rows(),
         "files": len(files),
         "skipped_symlinks": skipped,
         "anchored_files": len([f for f in files if f in anchored]),
@@ -2837,7 +3233,10 @@ def cmd_orient(ctx: Context, args: argparse.Namespace) -> int:
         return 0
     n = ORIENT_MAX_LIST
     ctx.say("root: %s" % ctx.root)
-    ctx.say("git head: %s" % (payload["git_head"] or ("none" if payload["git_available"] else "none (not a Git repository)")))
+    if payload["codebases"]:
+        say_codebases(ctx, payload["codebases"])
+    else:
+        ctx.say("git head: %s" % (payload["git_head"] or ("none" if payload["git_available"] else "none (not a Git repository)")))
     ctx.say("files: %d (symlinks skipped: %d), anchored: %d" % (len(files), skipped, payload["anchored_files"]))
     ctx.say("study documents: " + " ".join("%s=%d" % (k, v) for k, v in payload["study_documents"].items()))
     langs = payload["languages"]
@@ -2887,6 +3286,8 @@ examples:
   python .study/kernel.py evidence add ANC-0001 --type source-inspection --result "..." --run RUN-0001
   python .study/kernel.py claim add SYS-auth "verify_token rejects empty tokens" --anchor ANC-0001 --run RUN-0001
   python .study/kernel.py orient
+  python .study/kernel.py codebase scan                       # study root holds several repositories
+  python .study/kernel.py codebase add --detected
   python .study/kernel.py search token expiry
   python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry points"
 
@@ -2993,6 +3394,23 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--end-line", dest="end_line", type=int)
     q.add_argument("--run", required=True)
 
+    p = sub.add_parser("codebase", help="manage which repositories under the study root are studied")
+    bsub = p.add_subparsers(dest="codebase_cmd", metavar="ACTION")
+    bsub.required = True
+    q = leaf(bsub, "add", "register repositories (workspace mode); anchors must fall inside one",
+             "python .study/kernel.py codebase add api web   |   codebase add --detected")
+    q.add_argument("paths", nargs="*", metavar="PATH", help="directory relative to the study root")
+    q.add_argument("--detected", action="store_true", help="register every Git work tree found by 'codebase scan'")
+    q.add_argument("--no-git", dest="no_git", action="store_true",
+                   help="allow a directory that is not a Git work tree (no source-change guard)")
+    q = leaf(bsub, "remove", "unregister a repository; records and files are kept",
+             "python .study/kernel.py codebase remove web")
+    q.add_argument("path", metavar="PATH")
+    leaf(bsub, "list", "show registered repositories, their HEAD and working-tree state",
+         "python .study/kernel.py codebase list")
+    leaf(bsub, "scan", "find Git work trees below the study root (read-only)",
+         "python .study/kernel.py codebase scan")
+
     p = sub.add_parser("evidence", help="record evidence")
     esub = p.add_subparsers(dest="evidence_cmd", metavar="ACTION")
     esub.required = True
@@ -3050,6 +3468,8 @@ def dispatch_key(args: argparse.Namespace) -> str:
         return "evidence:" + args.evidence_cmd
     if cmd == "claim":
         return "claim:" + args.claim_cmd
+    if cmd == "codebase":
+        return "codebase:" + args.codebase_cmd
     return cmd
 
 
@@ -3057,6 +3477,8 @@ HANDLERS = {
     "init": cmd_init, "run:start": cmd_run_start, "run:end": cmd_run_end, "new": cmd_new,
     "finding": cmd_finding, "anchor:add": cmd_anchor_add, "claim:add": cmd_claim_add, "set": cmd_set, "orient": cmd_orient, "evidence:add": cmd_evidence_add,
     "show": cmd_show, "list": cmd_list, "search": cmd_search, "graph": cmd_graph,
+    "codebase:add": cmd_codebase, "codebase:remove": cmd_codebase, "codebase:list": cmd_codebase,
+    "codebase:scan": cmd_codebase,
     "coverage": cmd_coverage, "check": cmd_check, "rebuild": cmd_rebuild, "status": cmd_status,
 }
 
@@ -3076,7 +3498,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: Any = None, stderr: Any =
     try:
         args = build_parser().parse_args(argv)
         key = dispatch_key(args)
-        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient")))
+        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient", "codebase:scan")))
         return int(HANDLERS[key](ctx, args) or 0)
     except KitError as exc:
         print("error: %s" % exc, file=err)
