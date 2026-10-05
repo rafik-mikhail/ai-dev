@@ -64,7 +64,7 @@ This allocates the next `CLM-NNNN` (unique across the study) and appends a line 
 - CLM-0001: verify_token rejects empty tokens (ANC-0001, EV-0001)
 ```
 
-Rules: at least one `--anchor` or `--evidence` is required, and every ID must already exist. Something you cannot ground yet belongs in `## Open questions` or in a finding. Add `--inference` to prefix the statement with `Inference:`. Claims are indexed, searchable, and can be named as an evidence subject (`evidence add CLM-0001 ...`). `check` reports duplicate claim IDs. A claim line is a record, so do not edit its ID; to retract one, say so in the document body. Hand-written claim lines still parse, but do not put example claim lines in prose outside HTML comments.
+Rules: at least one `--anchor` or `--evidence` is required, and every ID must already exist. Something you cannot ground yet belongs in `## Open questions` or in a finding. Add `--inference` to prefix the statement with `Inference:`. Claims are indexed, searchable, and can be named as an evidence subject (`evidence add CLM-0001 ...`). `check` reports duplicate claim IDs. A claim line is a record, so do not edit its ID; to retract one, say so in the document body.
 
 ### Status and confidence changes
 
@@ -73,15 +73,26 @@ Findings start `open`. Change a document with `set`:
 ```bash
 python .study/kernel.py set F-0001 --status triaged --run RUN-0001
 python .study/kernel.py set F-0001 --status dismissed --note "intended; see ADR-7" --run RUN-0001
+python .study/kernel.py evidence add F-0001 --type source-inspection --result "token expiry is now checked at token.py:52" --anchor ANC-0007 --run RUN-0001
+python .study/kernel.py set F-0001 --status resolved --note "re-read verify_token" --evidence EV-0009 --run RUN-0001
 python .study/kernel.py set SYS-auth --status reviewed --confidence observed --run RUN-0001
 ```
 
 | Kind | Allowed `--status` |
 |---|---|
-| finding | `open`, `triaged`, `dismissed` |
+| finding | `open`, `triaged`, `resolved`, `obsolete`, `dismissed` |
 | system, flow | `draft`, `reviewed`, `deprecated` |
 
-`dismissed` and `deprecated` require `--note`. `--confidence` accepts only `hypothesis`, `inferred` or `observed`; the reserved levels are refused. Every change is appended to a `## Status log` section in the document (timestamp, agent, run, old and new value, note), so the history is durable Markdown, not just cold events. Runs cannot be changed with `set`; their status is managed by `run start` and `run end`. `fixed` is deliberately not a V0 status, because V0 never changes source.
+`dismissed`, `resolved`, `obsolete` and `deprecated` require `--note`. `--confidence` accepts only `hypothesis`, `inferred` or `observed`; the reserved levels are refused. Every change is appended to a `## Status log` section in the document (timestamp, agent, run, old and new value, note), so the history is durable Markdown, not just cold events. Runs cannot be changed with `set`; their status is managed by `run start` and `run end`. There is no `fixed` status: V0 cannot know who fixed what, so `resolved` records an observation.
+
+### Finding lifecycle
+
+Code changes inside and outside kernel sessions, so findings go out of date. A finding closes as `resolved` (the problem is gone from the source, however it got fixed), `obsolete` (the code was removed or rewritten) or `dismissed` (never a problem, or intended).
+
+- `open` and `triaged` findings can move to any closed status, inside a run. A closed finding can only return to `open`, with a `--note`.
+- `resolved` and `obsolete` need a `--note` and `--evidence`: evidence added in the same run with the finding as subject, showing the source as it is now. The status log names it and the HEAD of each codebase the finding's anchors live in (`source as of ...`). That is an observation at a commit, not proof that a test passed.
+- `check` and `status` flag an `open` or `triaged` finding whose anchors drifted as `finding-needs-recheck`. Re-read the source, then close it or leave it open. The kernel never closes one itself.
+- Anchors owned by closed findings and `deprecated` documents raise no freshness warnings. Nothing is deleted.
 
 ## 4. Confidence vocabulary
 
@@ -115,13 +126,12 @@ Limits you must keep in mind:
 
 ### Several codebases under one study root
 
-When the study root is a folder that holds several repositories, register the ones in scope: `codebase scan` finds candidates, `codebase add PATH` registers one, `codebase remove PATH` unregisters it (records stay), `codebase list` shows each one's HEAD and working-tree state. The registry is `.study/codebases.json`. With nothing registered, the root is the single codebase and nothing below applies.
+When the study root holds several repositories, register the ones in scope: `codebase scan` finds candidates, `codebase add PATH` registers one, `codebase remove PATH` unregisters it (records stay), `codebase list` shows each one's state. The registry is `.study/codebases.json`. With nothing registered the root is the single codebase and none of this applies.
 
-- An anchor must fall inside a registered codebase. Its `path` stays relative to the study root, its `repository` field names the codebase, and its `commit` is that repository's HEAD.
-- Freshness is judged against the anchor's own repository, and `run start` / `run end` snapshot every registered codebase separately. A change in any one marks the run `source_changed` and names it.
-- Unregistered folders are outside the study: they cannot be anchored and are ignored by `orient` and `coverage`.
-- The map cannot change while a run is open. Removing a codebase keeps its anchors, and `check` warns about anchors whose codebase is not registered.
-- Evidence takes its commit from the single codebase its anchors belong to; it is null when it cites anchors from several, or none.
+- An anchor must fall inside a registered codebase. Its `path` stays relative to the study root, `repository` names the codebase, and `commit` is that repository's HEAD. Freshness is judged against that repository.
+- `run start` and `run end` snapshot each codebase separately; a change in any one marks the run `source_changed` and names it. The map cannot change while a run is open.
+- Unregistered folders cannot be anchored and are ignored by `orient` and `coverage`. `check` warns about anchors whose codebase is not registered.
+- Evidence takes its commit from the one codebase its anchors belong to, and is null when they span several or none.
 
 ## 6. Study workflow
 

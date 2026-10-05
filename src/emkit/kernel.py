@@ -60,9 +60,25 @@ KINDS = ("system", "flow", "finding", "run")
 KIND_STATUSES = {
     "system": ("draft", "reviewed", "deprecated"),
     "flow": ("draft", "reviewed", "deprecated"),
-    "finding": ("open", "triaged", "dismissed"),  # "fixed" is intentionally absent in V0
+    "finding": ("open", "triaged", "resolved", "obsolete", "dismissed"),
     "run": ("open", "ended", "source_changed"),
 }
+# Finding lifecycle. A finding is closed in one of three ways, each meaning something different:
+#   resolved  the problem was real and the source no longer has it (fixed by anyone, anywhere)
+#   obsolete  the code was removed or rewritten, so the finding no longer applies
+#   dismissed it was never a problem, or it is intended
+# Study mode never changes source, so "resolved" and "obsolete" record a re-inspection (evidence from the
+# current run), never an inference from a commit message. A closed finding can only be reopened.
+FINDING_CLOSED = ("resolved", "obsolete", "dismissed")
+FINDING_NEEDS_EVIDENCE = ("resolved", "obsolete")
+FINDING_TRANSITIONS = {
+    "open": ("triaged", "resolved", "obsolete", "dismissed"),
+    "triaged": ("open", "resolved", "obsolete", "dismissed"),
+    "resolved": ("open",),
+    "obsolete": ("open",),
+    "dismissed": ("open",),
+}
+QUIET_STATUSES = FINDING_CLOSED + ("deprecated",)  # drift in their anchors is expected, not a warning
 KIND_DIRS = {"system": "systems", "flow": "flows", "finding": "findings"}
 KIND_ID_PREFIX = {"system": "SYS-", "flow": "FLOW-"}
 
@@ -1421,7 +1437,10 @@ def analyze(ctx: "Context", rec: Records, evaluate: bool = True) -> List[Problem
             out.append(Problem("error", "claim-duplicate",
                                "claim %s appears %d times (%s)" % (claim, len(owners), ", ".join(owners))))
     if evaluate:
+        quiet = {d["id"] for d in rec.docs if d["status"] in QUIET_STATUSES}
         for a in rec.anchors:
+            if a["doc_id"] in quiet:
+                continue
             where = doc_path_by_id.get(a["doc_id"])
             if a["state"] == "unchecked":
                 out.append(Problem("error", "anchor-unchecked",
@@ -1429,8 +1448,21 @@ def analyze(ctx: "Context", rec: Records, evaluate: bool = True) -> List[Problem
             elif a["state"] != "ok":
                 out.append(Problem("warning", "anchor-" + a["state"].replace("_", "-"),
                                    "anchor %s is %s (%s)" % (a["id"], a["state"], a["path"]), where))
+        state_by_anchor = {a["id"]: a["state"] for a in rec.anchors}
+        for d in rec.docs:
+            if d["kind"] != "finding" or d["status"] not in ("open", "triaged"):
+                continue
+            drifted = [(i, state_by_anchor[i]) for i in d["fm"].get("anchors", [])
+                       if state_by_anchor.get(i) in ("stale", "missing_file", "missing_symbol")]
+            if drifted:
+                out.append(Problem("warning", "finding-needs-recheck",
+                                   "finding %s may be out of date (%s); re-inspect it, then close it with "
+                                   "set --status resolved|obsolete|dismissed, or leave it open"
+                                   % (d["id"], ", ".join("%s is %s" % x for x in drifted)), d["path"]))
         registered = set(ctx.codebases) if ctx.codebases else {"."}
         for a in rec.anchors:
+            if a["doc_id"] in quiet:
+                continue
             if a["repository"] not in registered:
                 out.append(Problem("warning", "anchor-codebase-unregistered",
                                    "anchor %s belongs to codebase %s, which is not registered (%s codebase add %s)"
@@ -2937,9 +2969,12 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     for d in rec.docs:
         counts[d["kind"]] += 1
     open_findings = {s: 0 for s in SEVERITIES}
+    finding_status = {s: 0 for s in KIND_STATUSES["finding"]}
     for d in rec.docs:
-        if d["kind"] == "finding" and d["status"] == "open":
-            open_findings[d["fm"]["severity"]] += 1
+        if d["kind"] == "finding":
+            finding_status[d["status"]] += 1
+            if d["status"] == "open":
+                open_findings[d["fm"]["severity"]] += 1
     open_runs = sorted(r["id"] for r in rec.runs if r["status"] == "open")
     anchor_counts = {s: 0 for s in ANCHOR_STATES}
     for a in rec.anchors:
@@ -2950,9 +2985,13 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     for d in rec.docs:
         if d["kind"] == "finding" and d["status"] == "open" and d["fm"]["severity"] in ("high", "critical"):
             attention.append("open %s finding %s: %s" % (d["fm"]["severity"], d["id"], d["title"]))
+    quiet = {d["id"] for d in rec.docs if d["status"] in QUIET_STATUSES}
     for a in rec.anchors:
-        if a["state"] != "ok":
+        if a["state"] != "ok" and a["doc_id"] not in quiet:
             attention.append("anchor %s is %s (%s)" % (a["id"], a["state"], a["path"]))
+    for p in problems:
+        if p.code == "finding-needs-recheck":
+            attention.append(p.message)
     n_err = len([p for p in problems if p.severity == "error"])
     if n_err:
         attention.append("%d structural error(s); run: check" % n_err)
@@ -2967,7 +3006,7 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
     head = ctx.git.head()
     payload = {
         "git_available": ctx.git.available(), "git_head": head, "documents": counts,
-        "open_findings": open_findings, "open_runs": open_runs, "anchor_states": anchor_counts,
+        "open_findings": open_findings, "finding_status": finding_status, "open_runs": open_runs, "anchor_states": anchor_counts,
         "search_backend": index.backend(), "database": ctx.display(index.db_path),
         "database_present": index.exists(), "attention": attention,
     }
@@ -2982,6 +3021,7 @@ def cmd_status(ctx: Context, args: argparse.Namespace) -> int:
         ctx.say("git head: %s" % (head or ("none" if ctx.git.available() else "none (not a Git repository)")))
     ctx.say("documents: " + " ".join("%s=%d" % (k, counts[k]) for k in KINDS))
     ctx.say("open findings: " + " ".join("%s=%d" % (s, open_findings[s]) for s in SEVERITIES))
+    ctx.say("findings: " + " ".join("%s=%d" % (s, finding_status[s]) for s in KIND_STATUSES["finding"]))
     ctx.say("open runs: %s" % (", ".join(open_runs) if open_runs else "none"))
     ctx.say("anchors: " + " ".join("%s=%d" % (s, anchor_counts[s]) for s in ANCHOR_STATES))
     ctx.say("search backend: %s" % payload["search_backend"])
@@ -3082,6 +3122,20 @@ def cmd_claim_add(ctx: Context, args: argparse.Namespace) -> int:
     return 0
 
 
+def source_as_of(ctx: Context, fm: Dict[str, Any]) -> str:
+    """Where the source stood when a finding was closed: the HEAD of each codebase its anchors live in."""
+    wanted = set(fm.get("anchors", []))
+    repos = sorted({a["repository"] for a in load_records(ctx, evaluate=False).anchors if a["id"] in wanted})
+    if not repos:
+        repos = [] if ctx.codebases else ["."]
+    parts = []
+    for repo in repos:
+        head = ctx.git.head_for(repo)
+        label = "HEAD" if repo == "." else repo
+        parts.append("%s %s" % (label, head[:12] if head else "(no commit)"))
+    return ", ".join(parts) or "no recorded codebase"
+
+
 def cmd_set(ctx: Context, args: argparse.Namespace) -> int:
     run_id = require_open_run(ctx, args.run)
     doc_id = args.id
@@ -3091,6 +3145,12 @@ def cmd_set(ctx: Context, args: argparse.Namespace) -> int:
         raise KitError("set works on system, flow or finding documents (SYS-*, FLOW-*, F-NNNN); got %r" % doc_id)
     if args.status is None and args.confidence is None:
         raise KitError("nothing to change: give --status and/or --confidence")
+    cited: List[str] = []
+    for ref in args.evidence or []:
+        if not EV_ID_RE.match(ref or ""):
+            raise KitError("invalid evidence ID %r (expected EV-NNNN)" % ref)
+        if ref not in cited:
+            cited.append(ref)
     path = doc_path(ctx, doc_id)
     if not path.is_file():
         raise KitError("unknown document: %s" % doc_id)
@@ -3104,9 +3164,38 @@ def cmd_set(ctx: Context, args: argparse.Namespace) -> int:
             raise KitError("status %r is not allowed for a %s (allowed: %s)" % (args.status, kind, ", ".join(allowed)))
         if args.status in ("dismissed", "deprecated") and not note:
             raise KitError("--note is required when setting status %s (say why)" % args.status)
+        if kind == "finding" and args.status != fm["status"]:
+            if args.status not in FINDING_TRANSITIONS[fm["status"]]:
+                raise KitError("a %s finding can only move to: %s%s"
+                               % (fm["status"], ", ".join(FINDING_TRANSITIONS[fm["status"]]),
+                                  " (reopen it first)" if fm["status"] in FINDING_CLOSED else ""))
+            if args.status in FINDING_NEEDS_EVIDENCE and not note:
+                raise KitError("--note is required when setting status %s (say what you re-inspected)" % args.status)
+            if args.status == "open" and fm["status"] in FINDING_CLOSED and not note:
+                raise KitError("--note is required to reopen a finding (say why it is back)")
+        if args.status in FINDING_NEEDS_EVIDENCE and kind == "finding" and args.status != fm["status"]:
+            if not cited:
+                raise KitError("status %s needs --evidence EV-NNNN from a re-inspection in this run: "
+                               "%s evidence add %s --type source-inspection --result \"...\" --anchor ANC-NNNN --run %s"
+                               % (args.status, ctx.kernel_cmd(), doc_id, run_id))
         if args.status != fm["status"]:
             changes.append("status %s -> %s" % (fm["status"], args.status))
             fm["status"] = args.status
+    if cited:
+        if kind != "finding" or args.status is None:
+            raise KitError("--evidence applies to a finding status change")
+        known = {e["id"]: e for e in load_records(ctx, evaluate=False).evidence}
+        for ref in cited:
+            ev = known.get(ref)
+            if ev is None:
+                raise KitError("unknown evidence: %s" % ref)
+            if args.status in FINDING_NEEDS_EVIDENCE and (ev["run_id"] != run_id or ev["subject"] != doc_id):
+                raise KitError("%s must be recorded in this run (%s) with subject %s, so it shows the current "
+                               "state of the source; it is from %s about %s"
+                               % (ref, run_id, doc_id, ev["run_id"], ev["subject"]))
+    as_of = ""
+    if kind == "finding" and args.status in FINDING_NEEDS_EVIDENCE and changes:
+        as_of = source_as_of(ctx, fm)
     if args.confidence is not None:
         if args.confidence not in V0_CREATABLE_CONFIDENCE:
             raise KitError("confidence must be one of %s in V0 ('corroborated', 'executed' and 'verified' are "
@@ -3123,11 +3212,19 @@ def cmd_set(ctx: Context, args: argparse.Namespace) -> int:
     entry = "- %s %s: %s (%s)" % (stamp, ctx.agent, "; ".join(changes), run_id)
     if note:
         entry += " - " + md_safe(note)
+    extra = []
+    if cited:
+        extra.append("evidence " + ", ".join(cited))
+    if as_of:
+        extra.append("source as of " + as_of)
+    if extra:
+        entry += " [" + "; ".join(extra) + "]"
     body = append_to_section(body, "Status log", entry)
     fm["updated"] = stamp
     fm["updated_by"] = ctx.agent
     write_doc_file(ctx, path, fm, body.rstrip("\n") + "\n")
-    append_event(ctx, run_id, "set", [doc_id], {"changes": changes, "note": note})
+    append_event(ctx, run_id, "set", [doc_id] + cited, {"changes": changes, "note": note, "evidence": cited,
+                                                       "source_as_of": as_of})
     refresh_index(ctx)
     if ctx.json_mode:
         ctx.emit_json({"id": doc_id, "changes": changes})
@@ -3374,9 +3471,12 @@ def build_parser() -> argparse.ArgumentParser:
     q = leaf(sub, "set", "change a document's status and/or confidence (logged in its Status log)",
              'python .study/kernel.py set F-0001 --status dismissed --note "intended behavior, see ADR" --run RUN-0001')
     q.add_argument("id", help="SYS-*, FLOW-* or F-NNNN")
-    q.add_argument("--status", help="system/flow: draft, reviewed, deprecated; finding: open, triaged, dismissed")
+    q.add_argument("--status", help="system/flow: draft, reviewed, deprecated; "
+                                    "finding: open, triaged, resolved, obsolete, dismissed")
     q.add_argument("--confidence", choices=V0_CREATABLE_CONFIDENCE, help="hypothesis, inferred or observed")
-    q.add_argument("--note", help="reason (required for dismissed and deprecated)")
+    q.add_argument("--note", help="reason (required for dismissed, deprecated, resolved, obsolete and for reopening)")
+    q.add_argument("--evidence", action="extend", nargs="+", metavar="EV-NNNN",
+                   help="re-inspection evidence from this run about the finding (required for resolved, obsolete)")
     q.add_argument("--run", required=True, help="open run ID")
 
     leaf(sub, "orient", "survey languages, build tools, tests and entry-point candidates (read-only)",

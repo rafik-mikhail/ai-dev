@@ -22,8 +22,8 @@
     "anchorState": { "enum": ["ok", "stale", "missing_file", "missing_symbol", "unchecked"] },
     "kind": { "enum": ["system", "flow", "finding", "run"] },
     "status": {
-      "description": "Allowed statuses depend on kind: system/flow = draft, reviewed, deprecated; finding = open, triaged, dismissed; run = open, ended, source_changed.",
-      "enum": ["draft", "reviewed", "deprecated", "open", "triaged", "dismissed", "ended", "source_changed"]
+      "description": "Allowed statuses depend on kind: system/flow = draft, reviewed, deprecated; finding = open, triaged, resolved, obsolete, dismissed; run = open, ended, source_changed.",
+      "enum": ["draft", "reviewed", "deprecated", "open", "triaged", "resolved", "obsolete", "dismissed", "ended", "source_changed"]
     },
     "timestamp": {
       "type": "string",

@@ -142,7 +142,7 @@ python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry point
 | `new system\|flow SLUG --title --run` | Create a document from a template |
 | `finding TITLE --severity --run` | Record a potential issue (never a fix) |
 | `claim add DOC "text" --anchor/--evidence` | Append a numbered, grounded claim to a system or flow |
-| `set ID --status/--confidence [--note]` | Change status or confidence; logged in the document's Status log |
+| `set ID --status/--confidence [--note] [--evidence]` | Change status or confidence; logged in the document's Status log. Findings close as `resolved`, `obsolete` or `dismissed` |
 | `anchor add DOC PATH` | Bind a document to source lines with a fingerprint and the Git SHA of its codebase |
 | `codebase add\|remove\|list\|scan` | Choose which repositories under the study root are studied (workspace mode) |
 | `evidence add SUBJECT --type --result` | Append an evidence record to the run |
@@ -173,6 +173,7 @@ The full rules, vocabulary and record formats are in [PROTOCOL.md](src/emkit/res
 - Anchors prove provenance, not correctness. `ok` means the file, symbol text and fingerprint still match, not that a claim is true.
 - Stale and missing anchors are warnings (exit 0). Malformed records, duplicate IDs, unknown links and invalid evidence are errors (exit 1).
 - `verified` confidence is reserved and rejected in V0.
+- Findings are closed by observation, never by inference. `resolved` (the problem is gone), `obsolete` (the code was removed or rewritten) and `dismissed` (not a problem) all need a note, and the first two need evidence from a re-inspection in the same run; the log records the commit the source was at. When a finding's anchors drift, `check` and `status` flag it as `finding-needs-recheck`. The kernel never closes a finding by itself, and there is no `fixed` status because Study mode cannot know who fixed what.
 - `run end` compares Git HEAD and working-tree state with the run's start snapshot and marks the run `source_changed` if they differ.
 
 ## Limits

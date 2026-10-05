@@ -796,6 +796,142 @@ class TestSet(KitCase):
         self.assertIn("status: open", self.read("findings/F-0001.md"))
 
 
+class TestFindingLifecycle(KitCase):
+    """Findings go out of date: closed by observation (resolved, obsolete, dismissed), never by inference."""
+
+    def setUp(self):
+        super().setUp()
+        self.run1 = self.ready()  # RUN-0001 open, SYS-auth, ANC-0001 on src/auth.py lines 4-7
+        self.k("finding", "No expiry check", "--severity", "high", "--anchor", "ANC-0001", "--run", self.run1, ok=True)
+
+    def reinspect(self, run, note="re-read the code"):
+        res = self.k("evidence", "add", "F-0001", "--type", "source-inspection", "--result", note,
+                     "--anchor", "ANC-0001", "--run", run, ok=True)
+        return res.out.strip().splitlines()[-1]
+
+    def new_run(self):
+        self.k("run", "end", "--id", self.run1, "--summary", "first pass", ok=True)
+        return self.start_run("recheck")
+
+    def test_f01_vocabulary(self):
+        self.assertEqual(kernel.KIND_STATUSES["finding"], ("open", "triaged", "resolved", "obsolete", "dismissed"))
+        self.k("set", "F-0001", "--status", "fixed", "--note", "x", "--run", self.run1, ok=False)
+        schema = json.loads((RES / "schema.json").read_text(encoding="utf-8"))
+        self.assertTrue(set(kernel.KIND_STATUSES["finding"]) <= set(schema["$defs"]["status"]["enum"]))
+
+    def test_f02_resolved_needs_note_and_evidence(self):
+        ev = self.reinspect(self.run1)
+        res = self.k("set", "F-0001", "--status", "resolved", "--evidence", ev, "--run", self.run1, ok=False)
+        self.assertIn("--note", res.err)
+        res = self.k("set", "F-0001", "--status", "resolved", "--note", "gone", "--run", self.run1, ok=False)
+        self.assertIn("--evidence", res.err)
+        self.assertIn("evidence add F-0001", res.err)  # tells the agent what to do
+        self.assertIn("status: open", self.read("findings/F-0001.md"))
+        for status in ("resolved", "obsolete"):
+            self.k("set", "F-0001", "--status", status, "--note", "n", "--evidence", "EV-0099", "--run", self.run1,
+                   ok=False)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", "bogus", "--run", self.run1,
+               ok=False)
+
+    def test_f03_evidence_must_be_fresh_and_about_this_finding(self):
+        ev_old = self.reinspect(self.run1)
+        run2 = self.new_run()
+        res = self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", ev_old, "--run", run2,
+                     ok=False)
+        self.assertIn("must be recorded in this run", res.err)
+        other = self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "r",
+                       "--anchor", "ANC-0001", "--run", run2, ok=True).out.strip().splitlines()[-1]
+        res = self.k("set", "F-0001", "--status", "obsolete", "--note", "n", "--evidence", other, "--run", run2,
+                     ok=False)
+        self.assertIn("subject F-0001", res.err)
+        ev_new = self.reinspect(run2)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", ev_new, "--run", run2, ok=True)
+
+    def test_f04_status_log_records_evidence_and_commit(self):
+        ev = self.reinspect(self.run1)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "expiry now checked", "--evidence", ev,
+               "--run", self.run1, ok=True)
+        text = self.read("findings/F-0001.md")
+        self.assertIn("status: resolved", text)
+        line = [l for l in text.splitlines() if "open -> resolved" in l][0]
+        self.assertIn("expiry now checked", line)
+        self.assertIn("evidence " + ev, line)
+        if HAVE_GIT:
+            head = git(self.root, "rev-parse", "HEAD").stdout.decode().strip()
+            self.assertIn("source as of HEAD " + head[:12], line)
+        events = self.read("runs/%s/events.jsonl" % self.run1)
+        self.assertIn('"evidence": ["%s"]' % ev, events)
+        self.assertEqual(self.k("check").rc, 0)
+
+    def test_f05_obsolete_and_dismissed(self):
+        ev = self.reinspect(self.run1)
+        self.k("set", "F-0001", "--status", "obsolete", "--note", "module deleted", "--evidence", ev,
+               "--run", self.run1, ok=True)
+        self.assertIn("status: obsolete", self.read("findings/F-0001.md"))
+        self.k("set", "F-0001", "--status", "open", "--note", "restored", "--run", self.run1, ok=True)
+        self.k("set", "F-0001", "--status", "dismissed", "--run", self.run1, ok=False)  # note required
+        self.k("set", "F-0001", "--status", "dismissed", "--note", "intended", "--run", self.run1, ok=True)
+
+    def test_f06_transitions(self):
+        self.k("set", "F-0001", "--status", "triaged", "--run", self.run1, ok=True)
+        self.k("set", "F-0001", "--status", "dismissed", "--note", "intended", "--run", self.run1, ok=True)
+        res = self.k("set", "F-0001", "--status", "triaged", "--run", self.run1, ok=False)
+        self.assertIn("reopen it first", res.err)
+        self.k("set", "F-0001", "--status", "open", "--run", self.run1, ok=False)  # reopening needs a note
+        self.k("set", "F-0001", "--status", "open", "--note", "it is back", "--run", self.run1, ok=True)
+        self.k("set", "F-0001", "--status", "triaged", "--run", self.run1, ok=True)
+        log = [l for l in self.read("findings/F-0001.md").splitlines() if "tester: status" in l]
+        self.assertEqual(len(log), 4)
+
+    def test_f07_evidence_flag_only_on_finding_status_changes(self):
+        ev = self.reinspect(self.run1)
+        self.k("set", "SYS-auth", "--status", "reviewed", "--evidence", ev, "--run", self.run1, ok=False)
+        self.k("set", "F-0001", "--confidence", "observed", "--evidence", ev, "--run", self.run1, ok=False)
+
+    def test_f08_drift_flags_open_findings_for_recheck_and_closing_quiets_them(self):
+        self.k("run", "end", "--id", self.run1, "--summary", "s", ok=True)
+        text = (self.root / "src" / "auth.py").read_text(encoding="utf-8")
+        (self.root / "src" / "auth.py").write_text("# moved\n" + text, encoding="utf-8")
+        res = self.k("check", "--json", ok=True)
+        self.assertIn("finding-needs-recheck", self.problem_codes(res))
+        status = self.k("status", "--json", ok=True).json()
+        self.assertTrue(any("F-0001 may be out of date" in a for a in status["attention"]))
+        self.assertEqual(self.k("show", "F-0001", ok=True).rc, 0)
+        self.assertIn("status: open", self.read("findings/F-0001.md"))  # the kernel never closes by itself
+        run2 = self.start_run("recheck")
+        ev = self.reinspect(run2)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", ev, "--run", run2, ok=True)
+        codes = self.problem_codes(self.k("check", "--json", ok=True))
+        self.assertNotIn("finding-needs-recheck", codes)
+        self.assertIn("anchor-stale", codes)  # SYS-auth still owns that anchor and still drifts
+
+    def test_f09_anchors_owned_by_closed_findings_and_deprecated_docs_are_quiet(self):
+        self.k("new", "system", "old", "--title", "Old", "--run", self.run1, ok=True)
+        self.k("anchor", "add", "SYS-old", "src/auth.py", "--symbol", "verify_token", "--start-line", "4",
+               "--end-line", "7", "--run", self.run1, ok=True)
+        self.k("anchor", "add", "F-0001", "src/auth.py", "--start-line", "1", "--end-line", "3", "--run", self.run1,
+               ok=True)
+        self.k("set", "SYS-old", "--status", "deprecated", "--note", "removed", "--run", self.run1, ok=True)
+        ev = self.reinspect(self.run1)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", ev, "--run", self.run1, ok=True)
+        self.k("run", "end", "--id", self.run1, "--summary", "s", ok=True)
+        text = (self.root / "src" / "auth.py").read_text(encoding="utf-8")
+        (self.root / "src" / "auth.py").write_text("# moved\n" + text, encoding="utf-8")
+        res = self.k("check", "--json", ok=True)
+        stale = [p["message"] for p in res.json()["problems"] if p["code"] == "anchor-stale"]
+        self.assertEqual(len(stale), 1, stale)  # only SYS-auth's ANC-0001 is reported
+        self.assertIn("ANC-0001", stale[0])
+
+    def test_f10_closed_findings_stay_searchable_and_listed(self):
+        ev = self.reinspect(self.run1)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", ev, "--run", self.run1, ok=True)
+        self.assertIn("F-0001", self.k("search", "expiry", ok=True).out)
+        self.assertIn("F-0001", self.k("list", "--kind", "finding", "--status", "resolved", ok=True).out)
+        status = self.k("status", "--json", ok=True).json()
+        self.assertEqual(status["finding_status"]["resolved"], 1)
+        self.assertEqual(status["open_findings"]["high"], 0)
+
+
 class TestOrient(KitCase):
     def populate(self):
         files = {
@@ -1034,6 +1170,18 @@ class TestWorkspaceMode(KitCase):
         self.k("evidence", "add", "SYS-auth", "--type", "source-inspection", "--result", "c", "--run", run, ok=True)
         lines = [json.loads(l) for l in self.read("runs/%s/evidence.jsonl" % run).splitlines()]
         self.assertEqual([l["repository_commit"] for l in lines], [self.head("api"), None, None])
+
+    def test_w11b_closing_a_finding_records_each_codebase_head(self):
+        run = self.workspace()
+        for name in ("api", "web"):
+            self.k("anchor", "add", "SYS-auth", name + "/src/auth.py", "--run", run, ok=True)
+        self.k("finding", "x", "--severity", "low", "--anchor", "ANC-0001", "ANC-0002", "--run", run, ok=True)
+        self.k("evidence", "add", "F-0001", "--type", "source-inspection", "--result", "r", "--run", run, ok=True)
+        self.k("set", "F-0001", "--status", "resolved", "--note", "n", "--evidence", "EV-0001", "--run", run, ok=True)
+        log = [l for l in (self.study / "findings" / "F-0001.md").read_text(encoding="utf-8").splitlines()
+               if "open -> resolved" in l][0]
+        self.assertIn("api %s" % self.head("api")[:12], log)
+        self.assertIn("web %s" % self.head("web")[:12], log)
 
     def test_w12_coverage_and_orient_are_limited_to_registered_codebases(self):
         self.init()
