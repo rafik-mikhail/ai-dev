@@ -3384,7 +3384,11 @@ def cmd_orient(ctx: Context, args: argparse.Namespace) -> int:
 
 class KitArgumentParser(argparse.ArgumentParser):
     def error(self, message: str) -> None:  # type: ignore[override]
-        raise KitError(message)
+        try:
+            hint = usage_hint(self)
+        except Exception:  # a usage hint must never hide the real error
+            hint = ""
+        raise KitError(message + ("\n" + hint if hint else ""))
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -3393,7 +3397,7 @@ class KitArgumentParser(argparse.ArgumentParser):
 # ---------------------------------------------------------------------------------------------------------
 
 TOOL_PREFIX = "study_"
-TOOL_EXCLUDED_COMMANDS = ("init", "tools")  # setup and the tool layer itself are not offered to agents
+TOOL_EXCLUDED_COMMANDS = ("init", "tools", "commands")  # setup and the tool layer itself are not offered to agents
 TOOL_GLOBAL_DESTS = ("root", "study_dir", "agent", "json_out", "max_event_bytes", "help", "version")
 TOOL_GLOBAL_OPTIONS = (("root", "--root"), ("study_dir", "--study-dir"), ("agent", "--agent"),
                        ("max_event_bytes", "--max-event-bytes"))
@@ -3421,54 +3425,104 @@ def _sentence(text: str) -> str:
     return text[:1].upper() + text[1:] + ("" if text.endswith(".") else ".")
 
 
+def _leaf_params(leaf_parser: argparse.ArgumentParser) -> List[Dict[str, Any]]:
+    """The arguments of one command, from its argparse definition (global options excluded)."""
+    params: List[Dict[str, Any]] = []
+    for act in leaf_parser._actions:
+        if act.dest in TOOL_GLOBAL_DESTS or isinstance(act, (argparse._HelpAction, argparse._VersionAction)):
+            continue
+        positional = not act.option_strings
+        is_bool = isinstance(act, argparse._StoreTrueAction)
+        is_list = (not is_bool) and (act.nargs in ("+", "*") or isinstance(act, argparse._AppendAction))
+        prop: Dict[str, Any] = {}
+        if is_bool:
+            prop["type"] = "boolean"
+        elif is_list:
+            prop["type"] = "array"
+            prop["items"] = {"type": "string"}
+            if act.nargs == "+":
+                prop["minItems"] = 1
+        elif act.type is int:
+            prop["type"] = "integer"
+        else:
+            prop["type"] = "string"
+        if act.choices:
+            prop["enum"] = list(act.choices)
+        if act.help:
+            prop["description"] = act.help
+        if act.default is not None and act.default is not argparse.SUPPRESS and not is_bool:
+            prop["default"] = act.default
+        required = (positional and act.nargs in (None, "+")) or bool(getattr(act, "required", False) and not positional)
+        if act.choices:
+            metavar = "{%s}" % "|".join(str(c) for c in act.choices)
+        elif isinstance(act.metavar, str):
+            metavar = act.metavar
+        else:
+            metavar = act.dest.upper()
+        params.append({
+            "name": act.dest, "schema": prop, "required": required, "positional": positional,
+            "flag": None if positional else max(act.option_strings, key=len), "metavar": metavar,
+            "kind": "bool" if is_bool else "list" if is_list else "int" if act.type is int else "str",
+        })
+    params.sort(key=lambda p: not p["positional"])  # positionals first, otherwise declaration order
+    return params
+
+
 def tool_specs() -> List[Dict[str, Any]]:
     """One spec per exposed command: name, description, JSON Schema, and how arguments map back to argv."""
     specs: List[Dict[str, Any]] = []
     for path, leaf_parser in _parser_leaves(build_parser()):
         if not path or path[0] in TOOL_EXCLUDED_COMMANDS:
             continue
-        params: List[Dict[str, Any]] = []
-        for act in leaf_parser._actions:
-            if act.dest in TOOL_GLOBAL_DESTS or isinstance(act, (argparse._HelpAction, argparse._VersionAction)):
-                continue
-            positional = not act.option_strings
-            is_bool = isinstance(act, argparse._StoreTrueAction)
-            is_list = (not is_bool) and (act.nargs in ("+", "*") or isinstance(act, argparse._AppendAction))
-            prop: Dict[str, Any] = {}
-            if is_bool:
-                prop["type"] = "boolean"
-            elif is_list:
-                prop["type"] = "array"
-                prop["items"] = {"type": "string"}
-                if act.nargs == "+":
-                    prop["minItems"] = 1
-            elif act.type is int:
-                prop["type"] = "integer"
-            else:
-                prop["type"] = "string"
-            if act.choices:
-                prop["enum"] = list(act.choices)
-            if act.help:
-                prop["description"] = act.help
-            if act.default is not None and act.default is not argparse.SUPPRESS and not is_bool:
-                prop["default"] = act.default
-            required = (positional and act.nargs in (None, "+")) or bool(getattr(act, "required", False) and not positional)
-            params.append({
-                "name": act.dest, "schema": prop, "required": required, "positional": positional,
-                "flag": None if positional else max(act.option_strings, key=len),
-                "kind": "bool" if is_bool else "list" if is_list else "int" if act.type is int else "str",
-            })
-        params.sort(key=lambda p: not p["positional"])  # positionals first, otherwise declaration order
         specs.append({
             "name": TOOL_PREFIX + "_".join(path).replace("-", "_"),
             "path": list(path),
             "description": _sentence(leaf_parser.description or " ".join(path)),
-            "params": params,
+            "params": _leaf_params(leaf_parser),
         })
     names = [sp["name"] for sp in specs]
     if len(set(names)) != len(names):
         raise KitError("internal error: duplicate tool names")
     return specs
+
+
+def compact_syntax(path: Sequence[str], params: Sequence[Dict[str, Any]]) -> str:
+    """One-line syntax for a command: required parts bare, optional parts in brackets."""
+    parts = list(path)
+    for p in params:
+        if p["positional"]:
+            tok = p["metavar"] + (" ..." if p["kind"] == "list" else "")
+        elif p["kind"] == "bool":
+            tok = p["flag"]
+        else:
+            tok = "%s %s%s" % (p["flag"], p["metavar"], " ..." if p["kind"] == "list" else "")
+        parts.append(tok if p["required"] else "[%s]" % tok)
+    return " ".join(parts)
+
+
+def command_reference(parser: argparse.ArgumentParser) -> str:
+    lines = ["Commands (python .study/kernel.py COMMAND ...). Brackets are optional; '...' takes several values.", ""]
+    for path, leaf_parser in _parser_leaves(parser):
+        if not path:
+            continue
+        lines.append("  " + compact_syntax(path, _leaf_params(leaf_parser)))
+        lines.append("      " + _sentence(leaf_parser.description or " ".join(path)))
+    lines += ["",
+              "Global options, accepted by every command: --root PATH, --study-dir PATH, --agent NAME, --json,",
+              "--max-event-bytes N. Several values: --anchor ANC-0001 ANC-0002. IDs: SYS- FLOW- F- ANC- EV- CLM- RUN-.",
+              "Typed tool calls instead of a shell: tools list prints definitions, tools call NAME --args JSON runs one."]
+    return "\n".join(lines)
+
+
+def usage_hint(parser: argparse.ArgumentParser) -> str:
+    """The right syntax for the command that was misused, appended to argparse errors."""
+    path = parser.prog.split()[1:]
+    children = _parser_children(parser)
+    base = "python .study/kernel.py "
+    if children is not None:
+        return "usage: %s%s {%s} ...   (all commands: %scommands)" % (
+            base, " ".join(path) or "COMMAND", "|".join(children), base)
+    return "usage: " + base + compact_syntax(path, _leaf_params(parser))
 
 
 def tool_input_schema(spec: Dict[str, Any]) -> Dict[str, Any]:
@@ -3532,6 +3586,11 @@ def tool_argv(spec: Dict[str, Any], arguments: Dict[str, Any]) -> Tuple[List[str
         else:
             options.extend("%s=%s" % (p["flag"], item) for item in items)  # '=' keeps values that start with '-'
     return list(spec["path"]) + options, positionals
+
+
+def cmd_commands(ctx: Context, args: argparse.Namespace) -> int:
+    ctx.say(command_reference(build_parser()))
+    return 0
 
 
 def cmd_tools(ctx: Context, args: argparse.Namespace) -> int:
@@ -3634,7 +3693,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--goal", required=True, help="what this run intends to study")
     q = leaf(rsub, "end", "end a run, verify the source is unchanged, write the handoff",
              'python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth" --next "Trace refresh"')
-    q.add_argument("--id", required=True, help="explicit run ID (RUN-NNNN)")
+    q.add_argument("--id", required=True, metavar="RUN-NNNN", help="explicit run ID")
     q.add_argument("--summary", required=True, help="handoff summary text")
     q.add_argument("--next", help="suggested next step")
     q.add_argument("--open-question", dest="open_question", action="extend", nargs="+", metavar="TEXT",
@@ -3650,7 +3709,7 @@ def build_parser() -> argparse.ArgumentParser:
         q.add_argument("slug", help="lowercase letters, digits, single hyphens")
         q.add_argument("--title", required=True)
         q.add_argument("--area", help="repository-relative path")
-        q.add_argument("--run", required=True, help="open run ID")
+        q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
     q = leaf(sub, "finding", "record a potential finding (never apply a fix)",
              'python .study/kernel.py finding "Expiry not checked" --severity medium --anchor ANC-0001 --run RUN-0001')
@@ -3658,7 +3717,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--severity", required=True, choices=SEVERITIES)
     q.add_argument("--area")
     q.add_argument("--anchor", action="extend", nargs="+", metavar="ANC-NNNN", help="existing anchor IDs")
-    q.add_argument("--run", required=True)
+    q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
     p = sub.add_parser("claim", help="record a source-grounded claim in a system or flow")
     csub = p.add_subparsers(dest="claim_cmd", metavar="ACTION")
@@ -3670,18 +3729,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--anchor", action="extend", nargs="+", metavar="ANC-NNNN", help="existing anchor IDs")
     q.add_argument("--evidence", action="extend", nargs="+", metavar="EV-NNNN", help="existing evidence IDs")
     q.add_argument("--inference", action="store_true", help="prefix the claim with 'Inference:'")
-    q.add_argument("--run", required=True, help="open run ID")
+    q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
-    q = leaf(sub, "set", "change a document's status and/or confidence (logged in its Status log)",
+    q = leaf(sub, "set", "change a document's status and/or confidence (logged in its Status log); finding statuses: "
+             "open, triaged, resolved, obsolete, dismissed; system and flow statuses: draft, reviewed, deprecated",
              'python .study/kernel.py set F-0001 --status dismissed --note "intended behavior, see ADR" --run RUN-0001')
     q.add_argument("id", help="SYS-*, FLOW-* or F-NNNN")
-    q.add_argument("--status", help="system/flow: draft, reviewed, deprecated; "
-                                    "finding: open, triaged, resolved, obsolete, dismissed")
+    q.add_argument("--status", metavar="STATUS", help="system/flow: draft, reviewed, deprecated; "
+                                                      "finding: open, triaged, resolved, obsolete, dismissed")
     q.add_argument("--confidence", choices=V0_CREATABLE_CONFIDENCE, help="hypothesis, inferred or observed")
     q.add_argument("--note", help="reason (required for dismissed, deprecated, resolved, obsolete and for reopening)")
     q.add_argument("--evidence", action="extend", nargs="+", metavar="EV-NNNN",
                    help="re-inspection evidence from this run about the finding (required for resolved, obsolete)")
-    q.add_argument("--run", required=True, help="open run ID")
+    q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
     leaf(sub, "orient", "survey languages, build tools, tests and entry-point candidates (read-only)",
          "python .study/kernel.py orient --json")
@@ -3696,7 +3756,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--symbol")
     q.add_argument("--start-line", dest="start_line", type=int)
     q.add_argument("--end-line", dest="end_line", type=int)
-    q.add_argument("--run", required=True)
+    q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
     p = sub.add_parser("codebase", help="manage which repositories under the study root are studied")
     bsub = p.add_subparsers(dest="codebase_cmd", metavar="ACTION")
@@ -3727,7 +3787,7 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--limitation", action="extend", nargs="+", metavar="TEXT")
     q.add_argument("--command", dest="cmd_text", help="command text that produced the observation (recorded only)")
     q.add_argument("--exit-code", dest="exit_code", type=int)
-    q.add_argument("--run", required=True)
+    q.add_argument("--run", required=True, metavar="RUN-NNNN", help="open run ID")
 
     q = leaf(sub, "show", "show an artifact, its anchors, links, backlinks and evidence metadata",
              "python .study/kernel.py show RUN-0001 --events --limit 10")
@@ -3754,6 +3814,9 @@ def build_parser() -> argparse.ArgumentParser:
              "python .study/kernel.py coverage --depth 2")
     q.add_argument("--depth", type=int, default=1, help="directory grouping depth (default 1)")
 
+    leaf(sub, "commands", "print every command with its arguments (the one place to learn the syntax)",
+         "python .study/kernel.py commands")
+
     p = sub.add_parser("tools", help="export the commands as agent tool definitions, or call one from JSON")
     tsub = p.add_subparsers(dest="tools_cmd", metavar="ACTION")
     tsub.required = True
@@ -3769,6 +3832,7 @@ def build_parser() -> argparse.ArgumentParser:
     leaf(sub, "check", "validate records, anchors and index rebuildability", "python .study/kernel.py check --json")
     leaf(sub, "rebuild", "atomically rebuild the disposable index", "python .study/kernel.py rebuild")
     leaf(sub, "status", "summarize study state and items needing attention", "python .study/kernel.py status")
+    parser.epilog = command_reference(parser) + "\n\n" + TOP_EPILOG
     return parser
 
 
@@ -3796,7 +3860,7 @@ HANDLERS = {
     "finding": cmd_finding, "anchor:add": cmd_anchor_add, "claim:add": cmd_claim_add, "set": cmd_set, "orient": cmd_orient, "evidence:add": cmd_evidence_add,
     "show": cmd_show, "list": cmd_list, "search": cmd_search, "graph": cmd_graph,
     "codebase:add": cmd_codebase, "codebase:remove": cmd_codebase, "codebase:list": cmd_codebase,
-    "codebase:scan": cmd_codebase, "tools:list": cmd_tools, "tools:call": cmd_tools,
+    "codebase:scan": cmd_codebase, "tools:list": cmd_tools, "tools:call": cmd_tools, "commands": cmd_commands,
     "coverage": cmd_coverage, "check": cmd_check, "rebuild": cmd_rebuild, "status": cmd_status,
 }
 
@@ -3816,7 +3880,7 @@ def main(argv: Optional[Sequence[str]] = None, stdout: Any = None, stderr: Any =
     try:
         args = build_parser().parse_args(argv)
         key = dispatch_key(args)
-        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient", "codebase:scan", "tools:list", "tools:call")))
+        ctx = build_context(args, out, err, require_study=(key not in ("init", "orient", "codebase:scan", "tools:list", "tools:call", "commands")))
         return int(HANDLERS[key](ctx, args) or 0)
     except KitError as exc:
         print("error: %s" % exc, file=err)

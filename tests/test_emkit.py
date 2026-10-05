@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -30,9 +31,11 @@ EXPECTED_FILES = {
     ".study/kernel.py", ".study/PROTOCOL.md", ".study/schema.json", ".study/VERSION",
     ".study/templates/system.md", ".study/templates/flow.md", ".study/templates/finding.md",
     ".study/templates/run.md", ".study/AGENTS.md", "AGENTS.md",
+    ".claude/skills/engineering-study/SKILL.md", ".agents/skills/engineering-study/SKILL.md",
 }
 EXPECTED_DIRS = {".study", ".study/templates", ".study/systems", ".study/flows", ".study/findings",
-                 ".study/runs", ".study/scratch"}
+                 ".study/runs", ".study/scratch", ".claude", ".claude/skills", ".claude/skills/engineering-study",
+                 ".agents", ".agents/skills", ".agents/skills/engineering-study"}
 
 
 def git(root, *args):
@@ -157,7 +160,7 @@ class TestPackaging(unittest.TestCase):
         with zipfile.ZipFile(str(self.wheel)) as z:
             names = z.namelist()
             for required in ("emkit/__init__.py", "emkit/__main__.py", "emkit/cli.py", "emkit/kernel.py",
-                             "emkit/resources/PROTOCOL.md", "emkit/resources/AGENTS.md",
+                             "emkit/resources/PROTOCOL.md", "emkit/resources/AGENTS.md", "emkit/resources/SKILL.md",
                              "emkit/resources/schema.json", "emkit/resources/templates/system.md",
                              "emkit/resources/templates/flow.md", "emkit/resources/templates/finding.md",
                              "emkit/resources/templates/run.md"):
@@ -223,7 +226,7 @@ class TestMetadata(unittest.TestCase):
             if m.source is not None:
                 self.assertTrue(PKG.joinpath(*m.source).is_file(), m.source)
         # the root AGENTS.md is deliberately not a managed file: emkit only maintains a marked block in it
-        self.assertEqual({m.dest for m in cli.MANAGED}, EXPECTED_FILES - {"AGENTS.md"})
+        self.assertEqual({m.dest for m in cli.MANAGED}, EXPECTED_FILES - {"AGENTS.md"} - {m.dest for m in cli.SKILL_FILES})
 
 
 class TestInit(Base):
@@ -249,7 +252,7 @@ class TestInit(Base):
         self.assertTrue(root_agents.endswith(cli.BLOCK_END + "\n"))
         self.assertIn(cli.agents_body(), root_agents)
         for line in (".study/kernel.py", ".study/templates/run.md", "AGENTS.md", "kernel init: ok",
-                     "kernel check: ok", "next steps:", "kernel.py --help", "run start --goal"):
+                     "kernel check: ok", "next steps:", "kernel.py commands", "run start --goal"):
             self.assertIn(line, proc.stdout)
 
     def test_06_installed_kernel_never_imports_emkit(self):
@@ -417,18 +420,21 @@ class TestInit(Base):
         (self.repo / "untracked.txt").write_text("u\n", encoding="utf-8")
         sibling = self.tmp / "sibling.txt"
         sibling.write_text("s\n", encoding="utf-8")
-        before = snapshot(self.tmp, skip=("repo/.study", "repo/AGENTS.md", "repo/.git/info/exclude"))
+        before = snapshot(self.tmp, skip=("repo/.study", "repo/AGENTS.md", "repo/.git/info/exclude",
+                                              "repo/.claude", "repo/.agents"))
         index_before = (self.repo / ".git" / "index").read_bytes()
         exclude = self.repo / ".git" / "info" / "exclude"
         exclude_before = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
         self.init()
-        after = snapshot(self.tmp, skip=("repo/.study", "repo/AGENTS.md", "repo/.git/info/exclude"))
+        after = snapshot(self.tmp, skip=("repo/.study", "repo/AGENTS.md", "repo/.git/info/exclude",
+                                         "repo/.claude", "repo/.agents"))
         self.assertEqual(after, before)
         self.assertEqual((self.repo / ".git" / "index").read_bytes(), index_before)
         added = exclude.read_text(encoding="utf-8")[len(exclude_before):]
         self.assertEqual(set(l for l in added.splitlines() if l.strip()),
                          {".study/", ".study/study.db", ".study/study.db-wal", ".study/study.db-shm",
-                          ".study/scratch/"})
+                          ".study/scratch/", ".claude/skills/engineering-study/",
+                          ".agents/skills/engineering-study/"})
         status = git(self.repo, "status", "--porcelain").stdout.decode().splitlines()
         self.assertEqual(sorted(l[3:] for l in status), ["AGENTS.md", "src/app.py", "untracked.txt"])
 
@@ -645,6 +651,105 @@ class TestWorkspaceInstall(Base):
         # the studied repositories were not modified: still clean
         for repo in ("api", "web"):
             self.assertEqual(git(self.repo / repo, "status", "--porcelain").stdout, b"")
+
+
+class TestSkills(Base):
+    """The packaged SKILL.md (open Agent Skills format) is installed next to the AGENTS.md block."""
+
+    DIRS = (".claude/skills/engineering-study", ".agents/skills/engineering-study")
+
+    def skill(self, d):
+        return self.repo / Path(*d.split("/")) / "SKILL.md"
+
+    def test_s1_installed_in_both_locations_and_valid(self):
+        self.make_git_repo()
+        proc = self.init()
+        for d in self.DIRS:
+            self.assertIn("create    %s/SKILL.md" % d, proc.stdout)
+            text = self.skill(d).read_text(encoding="utf-8")
+            self.assertTrue(text.startswith("---\nname: engineering-study\ndescription: "), d)
+            head, _, body = text[4:].partition("\n---\n")
+            fields = dict(line.split(": ", 1) for line in head.splitlines())
+            self.assertEqual(fields["name"], Path(d).name)  # the spec: name matches the directory
+            self.assertTrue(re.match(r"^[a-z0-9]+(-[a-z0-9]+)*$", fields["name"]))
+            self.assertLessEqual(len(fields["name"]), 64)
+            self.assertTrue(0 < len(fields["description"]) <= 1024)
+            self.assertIn(cli.agents_body(), body)  # one source: the same block as AGENTS.md
+            self.assertNotIn("{{", text)
+        self.assertEqual(self.skill(self.DIRS[0]).read_bytes(), self.skill(self.DIRS[1]).read_bytes())
+
+    def test_s2_agents_text_teaches_commands_and_tool_calls(self):
+        body = cli.agents_body()
+        self.assertIn("kernel.py commands", body)
+        self.assertIn("study_*", body)
+        self.assertIn("tools call", body)
+        self.assertIn("tools list", body)
+        self.assertNotIn("kernel.py --help", body)
+
+    def test_s3_git_tree_stays_clean_apart_from_agents_md(self):
+        self.make_git_repo()
+        self.init()
+        status = git(self.repo, "status", "--porcelain").stdout.decode().strip().splitlines()
+        self.assertEqual(status, ["?? AGENTS.md"])
+        exclude = (self.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        for entry in (".study/", ".claude/skills/engineering-study/", ".agents/skills/engineering-study/"):
+            self.assertEqual(exclude.count(entry), 1, entry)
+        self.init()
+        exclude = (self.repo / ".git" / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(exclude.count(".claude/skills/engineering-study/"), 1)
+
+    def test_s4_idempotent_force_and_kept_files(self):
+        self.init()
+        snap = {d: self.skill(d).read_bytes() for d in self.DIRS}
+        again = self.init()
+        for d in self.DIRS:
+            self.assertIn("unchanged %s/SKILL.md" % d, again.stdout)
+        mine = self.skill(self.DIRS[0])
+        mine.write_text("my own skill\n", encoding="utf-8")
+        kept = self.init()
+        self.assertIn("skip      %s/SKILL.md" % self.DIRS[0], kept.stdout)
+        self.assertIn("use --force", kept.stdout)
+        self.assertEqual(mine.read_text(encoding="utf-8"), "my own skill\n")
+        forced = self.init(self.repo, "--force")
+        self.assertIn("replace   %s/SKILL.md" % self.DIRS[0], forced.stdout)
+        self.assertEqual({d: self.skill(d).read_bytes() for d in self.DIRS}, snap)
+
+    def test_s5_no_skills_and_dry_run_write_nothing(self):
+        dry = self.emkit("init", self.repo, "--dry-run", check=True)
+        self.assertIn("would create    %s/SKILL.md" % self.DIRS[0], dry.stdout)
+        self.assertFalse((self.repo / ".claude").exists() or (self.repo / ".agents").exists())
+        self.init(self.repo, "--no-skills")
+        self.assertIn("skip      agent skills (--no-skills)", self.emkit("init", self.repo, "--no-skills").stdout)
+        self.assertFalse((self.repo / ".claude").exists() or (self.repo / ".agents").exists())
+
+    def test_s6_existing_skills_directory_is_extended_not_replaced(self):
+        other = self.repo / ".claude" / "skills" / "other" / "SKILL.md"
+        other.parent.mkdir(parents=True)
+        other.write_text("keep me\n", encoding="utf-8")
+        self.init()
+        self.assertEqual(other.read_text(encoding="utf-8"), "keep me\n")
+        self.assertTrue(self.skill(self.DIRS[0]).is_file())
+
+    @unittest.skipIf(os.name == "nt", "symlinks need privileges on Windows")
+    def test_s7_symlinked_parent_leaving_the_repo_is_refused(self):
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (self.repo / ".claude").symlink_to(outside, target_is_directory=True)
+        proc = self.init()
+        self.assertIn("skip      .claude/skills/engineering-study/SKILL.md (a parent directory is a symlink", proc.stdout)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertTrue(self.skill(self.DIRS[1]).is_file())
+
+    def test_s8_doctor_reports_the_skill(self):
+        self.init()
+        ok = self.emkit("doctor", self.repo)
+        self.assertIn("agent skill engineering-study is current", ok.stdout)
+        self.skill(self.DIRS[1]).write_text("changed\n", encoding="utf-8")
+        self.skill(self.DIRS[0]).unlink()
+        res = self.emkit("doctor", self.repo)
+        self.assertEqual(res.returncode, 0, res.stdout)  # warnings only
+        self.assertIn("agent skill differs", res.stdout)
+        self.assertIn("agent skill not installed", res.stdout)
 
 
 class TestDoctor(Base):

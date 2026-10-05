@@ -31,7 +31,7 @@ Layout installed by `init`:
 
 Install with `emkit init PATH` (preferred; also writes `.study/VERSION` and the root `AGENTS.md`) or with the packaged `kernel.py init --root PATH`. Either way `.study/kernel.py` is a standalone copy: it needs only Python and never imports the `emkit` package.
 
-`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To version the knowledge, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`) to the same file. Those appends and the marked block `emkit init` adds to the root `AGENTS.md` are the only writes outside `.study/`.
+`emkit init` adds `.study/` to `.git/info/exclude`, so by default the workspace stays out of Git. To version the knowledge, delete that line and commit `systems/`, `flows/`, `findings/`, `runs/`, the templates and the kit files. The kernel's own `init` appends four narrower patterns (`.study/study.db`, `-wal`, `-shm`, `.study/scratch/`) to the same file. Those appends, the marked block `emkit init` adds to the root `AGENTS.md`, and the agent skill it installs (`engineering-study/SKILL.md` under `.claude/skills/` and `.agents/skills/`, also excluded from Git) are the only writes outside `.study/`.
 
 ## 3. Artifacts and IDs
 
@@ -87,7 +87,7 @@ python .study/kernel.py set SYS-auth --status reviewed --confidence observed --r
 
 ### Finding lifecycle
 
-Code changes inside and outside kernel sessions, so findings go out of date. A finding closes as `resolved` (the problem is gone from the source, however it got fixed), `obsolete` (the code was removed or rewritten) or `dismissed` (never a problem, or intended).
+Code changes, so findings go out of date. A finding closes as `resolved` (the problem is gone from the source), `obsolete` (the code was removed or rewritten) or `dismissed` (never a problem, or intended).
 
 - `open` and `triaged` findings can move to any closed status, inside a run. A closed finding can only return to `open`, with a `--note`.
 - `resolved` and `obsolete` need a `--note` and `--evidence`: evidence added in the same run with the finding as subject, showing the source as it is now. The status log names it and the HEAD of each codebase the finding's anchors live in (`source as of ...`). That is an observation at a commit, not proof that a test passed.
@@ -172,12 +172,12 @@ The agent rules are stricter than the kernel's: do not modify target source, tes
 - `events.jsonl` records each kernel action (run start/end, artifact creation, anchors, evidence, duplicates skipped) with timestamp, agent and short detail. Strings are truncated to 16384 bytes by default (`--max-event-bytes`, `STUDY_EVENT_MAX_BYTES`).
 - Events never contain source file contents. Anchors store a hash and line numbers, not the text. Evidence `result` and `limitations` are whatever you type, so do not paste secrets or credentials into them.
 - The source-change diff prints Git porcelain lines (paths and status codes) only.
-- Events are cold data. `search` ignores them, and `show` reads them only on request and bounded by `--limit` (default 50, maximum 1000).
+- Events are cold data: `search` ignores them, and `show` reads them only on request, bounded by `--limit` (default 50, maximum 1000).
 - If the study directory is committed or shared, review `runs/*/evidence.jsonl` and summaries first.
 
 ## 9. Index rebuildability
 
-`study.db` is derived state: documents, anchors, links, runs, evidence, event metadata, and an FTS5 table when SQLite has it (otherwise search uses `LIKE`). Rebuild runs in a single transaction. A parse error, duplicate ID or injected failure leaves the previous database usable. `check` also builds the index in memory to prove it can be rebuilt. If deleting `study.db` would lose knowledge, that is a bug.
+`study.db` is derived state: documents, anchors, links, runs, evidence, event metadata, and an FTS5 table when SQLite has it (otherwise search uses `LIKE`). Rebuild runs in a single transaction. Any failure leaves the previous database usable. `check` also builds the index in memory to prove it can be rebuilt. If deleting `study.db` would lose knowledge, that is a bug.
 
 Search matches document titles and bodies with AND semantics across words. Body text excludes HTML comments, so template instructions are not indexed.
 
@@ -185,10 +185,12 @@ Search matches document titles and bodies with AND semantics across words. Body 
 
 ```text
 init  orient  run start|end  new system|flow  finding  claim add  set  codebase add|remove|list|scan
-anchor add  evidence add  show  list  search  graph  coverage  check  rebuild  status  tools list|call
+anchor add  evidence add  show  list  search  graph  coverage  check  rebuild  status  commands  tools list|call
 ```
 
-`tools list [--format anthropic|openai]` prints every command except `init` as a JSON tool definition (`study_` plus the command path), generated from the argument parser. `tools call NAME --args JSON` validates the arguments, runs the command with `--json` and no shell, and prints `{ok, exit_code, output, error}`.
+`commands` prints every command's syntax, and `--help` ends with the same table. A wrong call prints the correct usage under the error.
+
+`tools list [--format anthropic|openai]` prints every command except `init` as a JSON tool definition, generated from the argument parser. `tools call NAME --args JSON` validates the arguments, runs the command with `--json` and no shell, and prints `{ok, exit_code, output, error}`.
 
 `orient` surveys the repository: file count, languages by extension, build tools by marker file, test directories and files, entry-point candidates by filename convention (plus `main`/`bin`/`scripts` keys from a root `package.json`), root docs, CI files and top-level directory sizes. It excludes the same directories as `coverage`. The output is layout heuristics: candidates to investigate, never evidence that code does anything.
 
@@ -196,8 +198,8 @@ Global options: `--root PATH`, `--study-dir PATH`, `--agent NAME` (or `STUDY_AGE
 
 ## 11. Future hardening
 
-Strong isolation belongs outside the kernel. A harness should mount the target source read-only, give the study directory a separate writable location, provide a disposable scratch directory, disable network access, omit remote credentials and secrets, and run each session in a throwaway sandbox. V0 implements none of this; it only makes the in-kernel guarantees above.
+Strong isolation belongs outside the kernel. A harness should mount the target source read-only, give the study directory a separate writable location and a disposable scratch directory, disable the network, omit credentials and secrets, and run each session in a throwaway sandbox. V0 implements none of this.
 
 ## 12. Future extensions (not in V0)
 
-Change records (`CHG-*`) with isolated git worktrees and candidate commits, an independent verifier identity with commit-bound validation evidence (the only path to `verified`), SCIP or language-server symbol identities, OpenTelemetry export, and signed in-toto-style evidence. The artifact model and schema leave room for these without a redesign.
+Change records (`CHG-*`) with isolated git worktrees and candidate commits, an independent verifier identity with commit-bound validation evidence (the only path to `verified`), SCIP or language-server symbol identities, OpenTelemetry export, and signed in-toto-style evidence.

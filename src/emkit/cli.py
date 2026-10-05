@@ -45,6 +45,12 @@ MANAGED: Tuple[Managed, ...] = (
     Managed(".study/AGENTS.md", ("resources", "AGENTS.md")),
     Managed(".study/VERSION", None),
 )
+# Agent skills (the open SKILL.md format) so agents that support skills load the rules without being asked.
+# One packaged template, rendered with the same Study block that goes into AGENTS.md; nothing is duplicated.
+SKILL_NAME = "engineering-study"
+SKILL_DIRS = tuple("%s/skills/%s" % (base, SKILL_NAME) for base in (".claude", ".agents"))
+SKILL_FILES = tuple(Managed(d + "/SKILL.md", None) for d in SKILL_DIRS)
+SKILL_PLACEHOLDER = "{{AGENTS_BLOCK}}"
 AGENTS_FILE = "AGENTS.md"  # at the root; never owned by emkit, only a marked block inside it
 BLOCK_BEGIN = "<!-- emkit:begin -->"
 BLOCK_END = "<!-- emkit:end -->"
@@ -59,6 +65,8 @@ TEMPLATE_DESTS = tuple(m.dest for m in MANAGED if m.dest.startswith(".study/temp
 
 def packaged_bytes(m: Managed) -> bytes:
     """Read a managed file's canonical content from the installed package."""
+    if m.source is None and m.dest.endswith("/SKILL.md"):
+        return skill_text().encode("utf-8")
     if m.source is None:
         return (__version__ + "\n").encode("utf-8")
     node = resources.files("emkit")
@@ -158,6 +166,26 @@ def file_state(root: Path, m: Managed) -> str:
         return "same" if dest.read_bytes() == packaged_bytes(m) else "differs"
     except OSError:
         return "differs"
+
+
+def skill_text() -> str:
+    node = resources.files("emkit") / "resources" / "SKILL.md"
+    try:
+        template = node.read_bytes().decode("utf-8").replace("\r\n", "\n")
+    except (OSError, FileNotFoundError) as exc:
+        raise EmkitError("packaged resource missing: resources/SKILL.md (%s)" % exc)
+    if SKILL_PLACEHOLDER not in template:
+        raise EmkitError("packaged skill template has no %s placeholder" % SKILL_PLACEHOLDER)
+    return template.replace(SKILL_PLACEHOLDER, agents_body()).rstrip("\n") + "\n"
+
+
+def skill_path_safe(root: Path, rel: str) -> bool:
+    """False when an existing parent of the skill file is a symlink that leaves the repository."""
+    probe = local_path(root, rel).parent
+    while not probe.exists() and probe != root:
+        probe = probe.parent
+    real = Path(os.path.realpath(str(probe)))
+    return real == root or is_inside(real, root)
 
 
 def agents_body() -> str:
@@ -346,6 +374,31 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             report.append("skip      %s (not valid UTF-8; left untouched even with --force)" % AGENTS_FILE)
 
+    skill_writes: List[Tuple[Managed, bytes]] = []
+    skill_owned: List[str] = []  # skill directories that are ours (created, current or replaced): excluded from Git
+    if args.no_skills:
+        report.append("skip      agent skills (--no-skills); the rules are still in AGENTS.md and %s/AGENTS.md" % STUDY_DIR)
+    else:
+        for m, d in zip(SKILL_FILES, SKILL_DIRS):
+            if not skill_path_safe(root, m.dest):
+                report.append("skip      %s (a parent directory is a symlink that leaves the repository)" % m.dest)
+                continue
+            state = file_state(root, m)
+            if state == "missing":
+                report.append("%screate    %s" % (prefix, m.dest))
+                skill_writes.append((m, packaged_bytes(m)))
+                skill_owned.append(d)
+            elif state == "same":
+                report.append("unchanged %s" % m.dest)
+                skill_owned.append(d)
+            elif args.force:
+                report.append("%sreplace   %s" % (prefix, m.dest))
+                skill_writes.append((m, packaged_bytes(m)))
+                skill_owned.append(d)
+            else:
+                report.append("skip      %s (differs from the packaged skill; existing file kept, use --force to replace)"
+                              % m.dest)
+
     codebases: List[str] = []  # absolute paths handed to the kernel
     for raw_cb in args.codebase:
         cb = Path(raw_cb).expanduser()
@@ -361,10 +414,13 @@ def cmd_init(args: argparse.Namespace) -> int:
         report.append("%sregister  every Git work tree found below %s (codebase scan)" % (prefix, root.as_posix()))
 
     exclude_file = git_exclude_path(root) if root.exists() else None
-    if exclude_file is not None and not exclude_has(exclude_file, EXCLUDE_ENTRY):
-        report.append("%s%s %s: %s" % (prefix, "append to" if exclude_file.exists() else "create",
-                                         ".git/info/exclude" if exclude_file.name == "exclude" else exclude_file.name,
-                                         EXCLUDE_ENTRY))
+    exclude_entries = [EXCLUDE_ENTRY] + [d + "/" for d in skill_owned]
+    if exclude_file is not None:
+        for entry in exclude_entries:
+            if not exclude_has(exclude_file, entry):
+                report.append("%s%s %s: %s" % (prefix, "append to" if exclude_file.exists() else "create",
+                                                 ".git/info/exclude" if exclude_file.name == "exclude" else exclude_file.name,
+                                                 entry))
 
     if args.dry_run:
         for line in report:
@@ -372,6 +428,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("dry run: nothing written")
         return 0
 
+    # The local exclude file is not part of the working tree; update it first so the before/after snapshots
+    # compare like with like.
+    if exclude_file is not None:
+        for entry in exclude_entries:
+            try:
+                ensure_exclude(exclude_file, entry)
+            except OSError as exc:
+                problems.append("cannot update %s: %s" % (exclude_file, exc))
     before = git_info(root)
     for d in missing_dirs:
         local_path(root, d).mkdir(parents=True, exist_ok=True)
@@ -379,11 +443,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         atomic_write(local_path(root, m.dest), data)
     if agents_write is not None:
         atomic_write(local_path(root, AGENTS_FILE), agents_write)
-    if exclude_file is not None:
-        try:
-            ensure_exclude(exclude_file, EXCLUDE_ENTRY)
-        except OSError as exc:
-            problems.append("cannot update %s: %s" % (exclude_file, exc))
+    for m, data in skill_writes:
+        local_path(root, m.dest).parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(local_path(root, m.dest), data)
     for line in report:
         print(line)
 
@@ -424,7 +486,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("installed emkit %s into %s" % (__version__, root.as_posix()))
     print("")
     print("next steps:")
-    print("  python %s/kernel.py --help                       list every command" % STUDY_DIR)
+    print("  python %s/kernel.py commands                     every command with its arguments" % STUDY_DIR)
     print("  python %s/kernel.py orient                       survey the repository" % STUDY_DIR)
     print('  python %s/kernel.py run start --goal "..."      begin a study run' % STUDY_DIR)
     print("  read %s/PROTOCOL.md once; the rules for AI agents are in AGENTS.md and %s/AGENTS.md" % (STUDY_DIR, STUDY_DIR))
@@ -519,6 +581,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                    % __version__)
         else:
             r.warn("AGENTS.md cannot be managed (%s); add the rules from %s/AGENTS.md by hand" % (a_state, STUDY_DIR))
+        states = {m.dest: file_state(root, m) for m in SKILL_FILES}
+        if all(v == "same" for v in states.values()):
+            r.ok("agent skill %s is current (.claude/skills and .agents/skills)" % SKILL_NAME)
+        else:
+            stale = [d for d, v in states.items() if v == "differs"]
+            absent = [d for d, v in states.items() if v == "missing"]
+            if stale:
+                r.warn("agent skill differs from emkit %s: %s (emkit init --force refreshes it)"
+                       % (__version__, ", ".join(stale)))
+            if absent:
+                r.warn("agent skill not installed: %s (emkit init adds it; --no-skills opts out)" % ", ".join(absent))
         cb_file = study / "codebases.json"
         if cb_file.is_file():
             try:
@@ -591,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="emkit",
         description="Install the Engineering Study Kit (.study/) into a repository. "
-                    "After install, use: python .study/kernel.py --help",
+                    "After install, use: python .study/kernel.py commands",
         epilog="examples:\n  emkit init .\n  emkit init ~/code/app --dry-run\n  emkit doctor .",
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version="emkit " + __version__)
@@ -609,6 +682,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true", help="print what would happen and write nothing")
     p.add_argument("--no-agents", dest="no_agents", action="store_true",
                    help="leave the root AGENTS.md alone (the rules are still installed as .study/AGENTS.md)")
+    p.add_argument("--no-skills", dest="no_skills", action="store_true",
+                   help="do not install the agent skill (.claude/skills/ and .agents/skills/%s/SKILL.md)" % SKILL_NAME)
     p.add_argument("--codebase", action="append", default=[], metavar="DIR",
                    help="register a repository below PATH as a codebase to study (repeatable; workspace mode)")
     p.add_argument("--detect", action="store_true",

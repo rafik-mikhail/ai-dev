@@ -1181,6 +1181,56 @@ class TestLineEndings(KitCase):
         self.assertEqual(self.k("check").rc, 0, self.k("check").err)
 
 
+class TestCommandReference(KitCase):
+    """One place to learn the syntax, so agents do not probe each command with --help."""
+
+    def test_c01_commands_lists_every_command_without_a_study_dir(self):
+        res = self.k("commands", ok=True)
+        self.assertFalse(self.study.exists())
+        for needle in ("run start --goal GOAL", "run end --id RUN-NNNN --summary SUMMARY",
+                       "anchor add DOCUMENT_ID PATH", "finding TITLE --severity {low|medium|high|critical}",
+                       "claim add DOCUMENT_ID TEXT", "set ID", "evidence add SUBJECT --type {source-inspection",
+                       "codebase add [PATH ...]", "search WORD ... [--limit LIMIT]", "tools call TOOL [--args ARGS]",
+                       "status", "check", "commands"):
+            self.assertIn(needle, res.out)
+        for path, parser in kernel._parser_leaves(kernel.build_parser()):
+            self.assertIn("  " + " ".join(path), res.out, path)  # every leaf command appears
+        self.assertIn("resolved", res.out)  # the set line names the finding statuses
+        self.assertIn("tools list", res.out)
+
+    def test_c02_help_ends_with_the_same_table(self):
+        out = io.StringIO()
+        with self.assertRaises(SystemExit):
+            with mock.patch("sys.stdout", out):
+                kernel.build_parser().parse_args(["--help"])
+        self.assertIn(kernel.command_reference(kernel.build_parser()), out.getvalue())
+
+    def test_c03_errors_show_the_right_usage(self):
+        self.init()
+        res = self.k("anchor", "add", ok=False)
+        self.assertTrue(res.err.startswith("error: the following arguments are required"))
+        self.assertIn("usage: python .study/kernel.py anchor add DOCUMENT_ID PATH", res.err)
+        self.assertIn("--run RUN-NNNN", res.err)
+        res = self.k("run", ok=False)
+        self.assertIn("usage: python .study/kernel.py run {start|end}", res.err)
+        self.assertIn("commands)", res.err)
+        res = self.k("bogus", ok=False)
+        self.assertIn("invalid choice", res.err)
+        self.assertIn("python .study/kernel.py commands", res.err)
+
+    def test_c04_tool_errors_carry_the_usage_too(self):
+        self.init()
+        env = self.k("tools", "call", "study_search", "--args", "{}", ok=False).json()
+        self.assertIn("needs argument 'words'", env["error"])  # validated before argparse; no usage needed
+        res = self.k("search", ok=False)
+        self.assertIn("usage: python .study/kernel.py search WORD ...", res.err)
+
+    def test_c05_commands_is_not_a_tool(self):
+        names = [t["name"] for t in json.loads(self.k("tools", "list", ok=True).out)]
+        self.assertNotIn("study_commands", names)
+        self.assertEqual(len(names), 22)
+
+
 class TestOrient(KitCase):
     def populate(self):
         files = {

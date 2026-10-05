@@ -13,7 +13,8 @@ uvx --from git+https://github.com/rafik-mikhail/ai-dev@v0.1.0 emkit init .
 Then use the installed local kernel:
 
 ```bash
-python .study/kernel.py --help
+python .study/kernel.py --help       # ends with every command and its arguments
+python .study/kernel.py commands     # the same table on its own
 ```
 
 On macOS and Linux, use `python3` if `python` is not on your PATH.
@@ -48,15 +49,17 @@ PYTHONPATH=./ai-dev-main/src python -m emkit init .
 
 ```bash
 emkit --version
-emkit init [PATH] [--force] [--dry-run] [--no-agents] [--codebase DIR ...] [--detect]
+emkit init [PATH] [--force] [--dry-run] [--no-agents] [--no-skills] [--codebase DIR ...] [--detect]
 emkit doctor [PATH]
 ```
 
-`emkit init` copies the packaged kernel, protocol, schema, agent rules and templates into `PATH/.study/`, writes `.study/VERSION`, adds the Study rules to `AGENTS.md` at the root of `PATH` (see below), creates the artifact directories, then runs the installed kernel's `init` and `check`. It prints every path it creates, replaces, skips or finds unchanged, and exits non-zero if the installation is incomplete.
+`emkit init` copies the packaged kernel, protocol, schema, agent rules and templates into `PATH/.study/`, writes `.study/VERSION`, adds the Study rules to `AGENTS.md` at the root of `PATH` and installs an agent skill (see below), creates the artifact directories, then runs the installed kernel's `init` and `check`. It prints every path it creates, replaces, skips or finds unchanged, and exits non-zero if the installation is incomplete.
 
 ```text
 PATH/
 ├── AGENTS.md              # created, or a marked Study block appended; see below
+├── .claude/skills/engineering-study/SKILL.md
+├── .agents/skills/engineering-study/SKILL.md
 └── .study/
     ├── kernel.py  PROTOCOL.md  schema.json  AGENTS.md  VERSION
     ├── templates/{system,flow,finding,run}.md
@@ -70,7 +73,7 @@ PATH/
 - Writes use a temporary file and an atomic rename. Symlinked destinations are refused.
 - Re-running `init` on an existing installation is safe: unchanged files are left alone, the index is rebuilt from your records.
 - There is no upgrade or merge command yet. To move to a newer kit, run a newer `emkit init --force` and review the diff in Git.
-- In a Git repository, `init` adds `.study/` to `.git/info/exclude` (creating the file if it is missing, appending otherwise, never duplicating), so the workspace stays out of `git status` and out of commits. The file is local to your clone and is not shared. To version the records instead, delete that line. The kernel also appends its four narrower patterns for the index and scratch files. Source files are never touched, and `init` fails if the working tree changes.
+- In a Git repository, `init` adds `.study/` and the two skill folders to `.git/info/exclude` (creating the file if it is missing, appending otherwise, never duplicating), so the workspace stays out of `git status` and out of commits. The file is local to your clone and is not shared. To version the records or the skill instead, delete the matching line. The kernel also appends its four narrower patterns for the index and scratch files. Source files are never touched, and `init` fails if the working tree changes.
 
 ### The root AGENTS.md
 
@@ -86,6 +89,14 @@ The root `AGENTS.md` belongs to the repository, not to the kit. `emkit` only eve
 | `--no-agents` | Leaves the file alone; the same rules are always installed as `.study/AGENTS.md` |
 
 The block is a short rule summary that points to `.study/PROTOCOL.md`. Whenever a file is kept, `init` says `skip` and what to do about it: managed files and a differing block say to use `--force`; a file it cannot safely edit says to fix it by hand. Agents read the nearest `AGENTS.md` in the directory tree and the closest one wins, so a repository's own file is never displaced by a workspace-level one. Appending changes a tracked file, which shows up in `git diff`; use `--no-agents` when you do not want that, for example in a repository you do not own.
+
+### The agent skill
+
+Agents that support the open [Agent Skills](https://agentskills.io/specification) format (a folder with a `SKILL.md` that has `name` and `description` frontmatter) load the skill when a study task starts. `init` writes the same file to `.claude/skills/engineering-study/` (Claude) and `.agents/skills/engineering-study/` (Codex and other tools that scan `.agents/skills`). It is generated at install time from one packaged template plus the same Study block that goes into `AGENTS.md`, so there is no second copy of the rules to keep in sync.
+
+- It tells the agent to run `python .study/kernel.py commands` once for the syntax of every command, instead of probing each command with `--help`, and how to use typed `study_*` tools when the harness provides them.
+- It follows the same rules as every managed file: created if missing, left alone if identical, kept with a `skip ... use --force` line if it differs, replaced only with `--force`. Other skills in those folders are never touched, and a symlinked parent that leaves the repository is refused.
+- `--no-skills` leaves it out. `emkit doctor` reports whether the skill is current (a warning, not a failure, when it is missing or different).
 
 ### One folder, several repositories (workspace mode)
 
@@ -114,7 +125,7 @@ The registry is `.study/codebases.json`. With no codebases registered the kit be
 - Removing a codebase unregisters it. Its anchors and records stay, and `check` warns that they belong to an unregistered codebase. A registered folder that disappears is also a warning, not an error.
 - The map cannot change while a run is open, because the guard compares the same set of repositories at start and end.
 
-`emkit doctor` reports Python compatibility, whether the directory and `.study/kernel.py` exist, the installed kit version, missing or differing managed files, readable templates, whether `AGENTS.md` carries the current Study block, the registered codebases, whether `kernel.py --help` runs, and Git availability and status (Git is optional). It does not judge your uncommitted changes; the no-source-change guarantee is enforced during `init` itself. It exits zero only when the installation is usable. A file that differs from the packaged copy is an error when the recorded kit version matches (corrupted or edited), and a warning when it comes from another version.
+`emkit doctor` reports Python compatibility, whether the directory and `.study/kernel.py` exist, the installed kit version, missing or differing managed files, readable templates, whether `AGENTS.md` carries the current Study block, whether the agent skill is current, the registered codebases, whether `kernel.py --help` runs, and Git availability and status (Git is optional). It does not judge your uncommitted changes; the no-source-change guarantee is enforced during `init` itself. It exits zero only when the installation is usable. A file that differs from the packaged copy is an error when the recorded kit version matches (corrupted or edited), and a warning when it comes from another version.
 
 The installed `.study/kernel.py` is a byte-for-byte copy of the packaged kernel. It needs only Python 3.9+, never imports `emkit`, and keeps working after the `uvx` environment is gone.
 
@@ -151,13 +162,14 @@ python .study/kernel.py run end --id RUN-0001 --summary "Mapped auth entry point
 | `check` | Validate records, anchors and index rebuildability |
 | `rebuild` | Rebuild `study.db` from the durable records |
 | `status` | Counts, open runs, anchor states, items needing attention |
+| `commands` | Every command with its arguments, generated from the kernel's own parser |
 | `tools list\|call` | Export the commands as agent tool definitions; run one from JSON arguments (see below) |
 
 Global options: `--root`, `--study-dir`, `--agent` (or `STUDY_AGENT`), `--json`, `--max-event-bytes`. `STUDY_DISABLE_FTS=1` forces the non-FTS search path. Errors print `error: ...` to stderr and exit 1. The operating rules are in `.study/PROTOCOL.md`; a walkthrough is in `examples/minimal/README.md`.
 
 ### As agent tools
 
-Agents with a shell run the commands above. For a harness that wants typed tool calls instead (Claude, OpenAI function calling, MCP wrappers, your own loop), the kernel exports its commands as tool definitions and can run one from JSON, with no shell involved:
+Agents with a shell run the commands above (a wrong call prints the correct usage under the error). For a harness that wants typed tool calls instead (Claude, OpenAI function calling, MCP wrappers, your own loop), the kernel exports its commands as tool definitions and can run one from JSON, with no shell involved:
 
 ```bash
 python .study/kernel.py tools list                    # JSON array: name, description, input_schema
